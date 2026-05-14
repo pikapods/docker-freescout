@@ -1,0 +1,42 @@
+name: freescout
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: freescout
+      POSTGRES_USER: freescout
+      POSTGRES_PASSWORD: changeme   # change before any real deployment
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U freescout -d freescout"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  freescout:
+    image: ${FREESCOUT_IMAGE:-ghcr.io/pikapods/docker-freescout:latest}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_URL: http://localhost:8080
+      DB_TYPE: pgsql
+      DB_HOST: postgres
+      DB_NAME: freescout
+      DB_USER: freescout
+      DB_PASS: changeme
+      ADMIN_EMAIL: admin@example.com
+      ADMIN_PASS: changeme
+    volumes:
+      - freescout-data:/data
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  freescout-data:

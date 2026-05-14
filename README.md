@@ -24,8 +24,24 @@ deployments can switch by changing only the image tag.
 
 ## Quick start
 
+The bundled `compose.yaml` brings up FreeScout plus a Postgres sidecar with
+zero external dependencies — the fastest way to try the image:
+
 ```bash
-podman run -d --name freescout \
+git clone https://github.com/pikapods/docker-freescout.git
+cd docker-freescout
+docker compose up -d
+# wait ~30s for first-boot migrations
+curl -I http://localhost:8080/login   # → HTTP/1.1 200 OK
+```
+
+Default credentials are `admin@example.com` / `changeme` — change them
+before any real deployment.
+
+Against an existing database:
+
+```bash
+docker run -d --name freescout \
   -v freescout-data:/data \
   -e APP_URL="https://support.example.com" \
   -e DB_TYPE=pgsql \
@@ -38,6 +54,21 @@ podman run -d --name freescout \
   -p 8080:8080 \
   ghcr.io/pikapods/docker-freescout:latest
 ```
+
+### Running on podman
+
+The compose file and `docker run` examples work as-is under
+`podman compose` / `podman run`. Three podman-specific notes:
+
+- **Build:** `podman build --format docker …`. Podman defaults to OCI
+  manifests, which silently drop the `HEALTHCHECK` instruction; docker
+  format embeds it.
+- **Rootless permissions:** rootless podman remaps UIDs, so the
+  container's `www-data` (UID 82) isn't host UID 82. Map explicitly:
+  `--userns=keep-id:uid=82,gid=82`. Rootful podman behaves like docker.
+- **Healthcheck inspection:** `podman healthcheck run <container>` runs
+  the check on demand. Docker runs it automatically; inspect with
+  `docker inspect --format '{{.State.Health.Status}}' <container>`.
 
 ## Environment variables
 
@@ -127,9 +158,11 @@ logs, cache) survives container restarts and image upgrades.
 Both nginx and php-fpm run as `www-data` (**UID 82 / GID 82** — Alpine's
 default, inherited from `serversideup/php:*-alpine`).
 
-Anything the container writes to `/data` lands as `82:82` on the host. For
-rootless podman, map it explicitly with `--userns=keep-id:uid=82,gid=82`; for
-rootful runs, `chown -R 82:82` on the host volume root before first start.
+Anything the container writes to `/data` lands as `82:82` on the host.
+Bind-mount targets need `chown -R 82:82` on the host before first start;
+named volumes (including the ones in `compose.yaml`) are daemon-owned and
+need no setup. Rootless podman additionally needs
+`--userns=keep-id:uid=82,gid=82` — see the podman notes in Quick start.
 
 ## Ports
 
@@ -158,7 +191,7 @@ Each boot:
 2. Any `FREESCOUT_*` env vars are **patched in** (set-through-once — see
    above).
 3. **Everything else in the file is preserved untouched.** Hand-edits via
-   `podman exec`, settings you've pasted in, custom mail config — all survive
+   `docker exec`, settings you've pasted in, custom mail config — all survive
    boots.
 
 This differs from typical container behavior where env vars are the full
@@ -178,60 +211,17 @@ patches*, not the canonical source.
 | `ENABLE_FREESCOUT_SCHEDULER` defaults `TRUE`           | FreeScout is broken without it.                          |
 | `SETUP_TYPE`, `ENABLE_AUTO_UPDATE`, `DB_SSL`, `DATA_PATH` dropped | Not supported. Use `FREESCOUT_DB_SSLMODE` for TLS; data path is fixed at `/data`; updates happen via image tag. |
 
-## Migration
-
-### From `tiredofit/docker-freescout`
-
-If you have `/data/config` as a directory containing the `.env`, the image
-will refuse to start with a clear error. Flatten it to a file:
-
-```bash
-# Inside the volume:
-mv /data/config /data/config.dir
-mv /data/config.dir/config /data/config
-rm -rf /data/config.dir
-```
-
-Then update the image tag and the reverse-proxy backend port (`80` → `8080`).
-If you had bind-mounts pointing at `/www/html`, move them to `/var/www/html`.
-Env vars carry over unchanged.
-
 ## Building locally
 
 ```bash
-podman build --format docker \
+docker build \
   --build-arg FREESCOUT_VERSION=1.8.219 \
   --build-arg PHP_VERSION=8.4 \
   -t freescout:test .
 ```
 
-`--format docker` is important: podman defaults to OCI manifests, which
-silently drop the `HEALTHCHECK` instruction. Docker format embeds it in the
-image metadata so `podman healthcheck run`, Quadlet, and orchestrators can
-use it. The CI build pushes Docker-format manifests for the same reason.
-
-Smoke test:
-
-```bash
-podman network create fs-smoke
-podman run -d --name pg --network fs-smoke \
-  -e POSTGRES_PASSWORD=test -e POSTGRES_DB=freescout postgres:16
-podman run -d --name fs --network fs-smoke \
-  -e APP_URL=http://localhost:8080 \
-  -e DB_TYPE=pgsql -e DB_HOST=pg -e DB_NAME=freescout \
-  -e DB_USER=postgres -e DB_PASS=test \
-  -e ADMIN_EMAIL=admin@test.local -e ADMIN_PASS=changeme \
-  -p 8080:8080 freescout:test
-curl -I http://localhost:8080/login   # → HTTP/1.1 200 OK
-```
-
-## Auto-rebuild
-
-`.github/workflows/upstream-watch.yml` runs daily at 06:00 UTC, polls the
-[freescout-helpdesk/freescout](https://github.com/freescout-helpdesk/freescout)
-releases API, and triggers `build.yml` when a new tag appears. The build
-workflow runs a smoke test (Postgres sidecar, `/login` returns 200, no
-`RuntimeException` in logs) before pushing.
+On podman, add `--format docker` — see the podman notes in Quick start for
+why. The CI build pushes Docker-format manifests for the same reason.
 
 ## License
 
