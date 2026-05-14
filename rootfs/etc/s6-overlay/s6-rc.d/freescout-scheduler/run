@@ -1,0 +1,20 @@
+#!/command/with-contenv sh
+# FreeScout scheduler — per-minute `php artisan schedule:run` loop.
+# Hard-kills a stuck tick (IMAP stall, DB cursor wedge) before the next minute.
+# Approximates cron's minute boundary without dragging in a second supervisor.
+
+[ "${ENABLE_FREESCOUT_SCHEDULER:-TRUE}" = "TRUE" ] || exec sleep infinity
+
+cd /var/www/html || exit 1
+
+while :; do
+    start=$(date +%s)
+    # BusyBox timeout (Alpine) uses short flags: -s SIG, -k SECS, then DURATION.
+    # GNU --signal/--kill-after long-flags would error with "unrecognized option".
+    timeout -s TERM -k 5 55 \
+        php artisan schedule:run >&2 || true
+    elapsed=$(( $(date +%s) - start ))
+    if [ "$elapsed" -lt 60 ]; then
+        sleep $(( 60 - elapsed ))
+    fi
+done

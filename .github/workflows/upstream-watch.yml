@@ -1,0 +1,61 @@
+name: Upstream watch
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PHP_VERSION: "8.4"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+      packages: read
+    steps:
+      - name: Compare upstream release to published tags
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          upstream=$(gh api repos/freescout-helpdesk/freescout/releases/latest --jq .tag_name)
+          expected_tag="${upstream}-php${PHP_VERSION}"
+          image="${REGISTRY}/${IMAGE_NAME}"
+          echo "upstream=${upstream}"
+          echo "expected_tag=${expected_tag}"
+
+          # Ask GHCR's OCI registry whether the tag is already published.
+          # The token endpoint hands out anonymous pull tokens for public
+          # images; for private images, swap in a PAT with read:packages.
+          token=$(curl -fsS "https://${REGISTRY}/token?service=${REGISTRY}&scope=repository:${IMAGE_NAME}:pull" | jq -r .token)
+
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${token}" \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+            "https://${REGISTRY}/v2/${IMAGE_NAME}/manifests/${expected_tag}")
+
+          if [ "${status}" = "200" ]; then
+            echo "published=true"  >>"$GITHUB_OUTPUT"
+            echo "${expected_tag} already published"
+          else
+            echo "published=false" >>"$GITHUB_OUTPUT"
+            echo "upstream=${upstream}" >>"$GITHUB_OUTPUT"
+            echo "${expected_tag} not in registry (HTTP ${status}); will trigger build"
+          fi
+
+      - name: Trigger build
+        if: steps.check.outputs.published == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run build.yml \
+            -f freescout_version='${{ steps.check.outputs.upstream }}' \
+            -f php_version='${{ env.PHP_VERSION }}'

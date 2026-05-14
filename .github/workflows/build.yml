@@ -1,0 +1,145 @@
+name: Build and publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      freescout_version:
+        description: "FreeScout version (e.g. 1.8.219)"
+        required: true
+        type: string
+      php_version:
+        description: "PHP minor version"
+        required: false
+        default: "8.4"
+        type: string
+  push:
+    tags:
+      - "v*"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve build args
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            FS_VER="${{ inputs.freescout_version }}"
+            PHP_VER="${{ inputs.php_version }}"
+          else
+            # Tag form: v<freescout-version> (e.g. v1.8.219)
+            FS_VER="${GITHUB_REF_NAME#v}"
+            PHP_VER="8.4"
+          fi
+          echo "freescout_version=$FS_VER" >>"$GITHUB_OUTPUT"
+          echo "php_version=$PHP_VER"      >>"$GITHUB_OUTPUT"
+          echo "image_tag=${FS_VER}-php${PHP_VER}" >>"$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (local load)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          platforms: linux/amd64
+          build-args: |
+            FREESCOUT_VERSION=${{ steps.vars.outputs.freescout_version }}
+            PHP_VERSION=${{ steps.vars.outputs.php_version }}
+          tags: freescout:smoke
+          provenance: false
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          docker network create fs-smoke
+
+          docker run -d --name pg --network fs-smoke \
+            -e POSTGRES_PASSWORD=test \
+            -e POSTGRES_DB=freescout \
+            postgres:16
+
+          # Wait for Postgres readiness.
+          for _ in $(seq 1 30); do
+            if docker exec pg pg_isready -U postgres >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          APP_KEY="base64:$(openssl rand -base64 32)"
+          docker run -d --name fs --network fs-smoke \
+            -e APP_KEY="$APP_KEY" \
+            -e APP_URL=http://localhost:8080 \
+            -e DB_TYPE=pgsql \
+            -e DB_HOST=pg \
+            -e DB_NAME=freescout \
+            -e DB_USER=postgres \
+            -e DB_PASS=test \
+            -e ADMIN_EMAIL=admin@smoke.local \
+            -e ADMIN_PASS=changeme \
+            -p 8080:8080 \
+            freescout:smoke
+
+          # Poll /login for 120s.
+          ok=0
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8080/login -o /dev/null; then
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+
+          echo "--- freescout container logs ---"
+          docker logs fs || true
+
+          if [ "$ok" -ne 1 ]; then
+            echo "ERROR: /login did not return 200 within 120s"
+            exit 1
+          fi
+
+          # Fail on known-bad log patterns.
+          if docker logs fs 2>&1 | grep -E 'RuntimeException|PHP Fatal'; then
+            echo "ERROR: bad pattern in container logs"
+            exit 1
+          fi
+
+          docker rm -f fs pg
+          docker network rm fs-smoke
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: |
+            FREESCOUT_VERSION=${{ steps.vars.outputs.freescout_version }}
+            PHP_VERSION=${{ steps.vars.outputs.php_version }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          # Push as a Docker-format manifest (not OCI). Reason: podman
+          # currently ignores HEALTHCHECK on OCI-format images. Docker
+          # manifests embed HEALTHCHECK metadata, and every modern registry
+          # + runtime accepts the Docker format.
+          # `provenance: false` skips the SLSA attestation index that would
+          # otherwise force a multi-arch-style manifest list.
+          provenance: false
+          outputs: |
+            type=image,push=true,oci-mediatypes=false
