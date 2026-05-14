@@ -12,6 +12,11 @@ on:
         required: false
         default: "8.4"
         type: string
+      publish:
+        description: "Publish to GHCR after tests pass"
+        required: false
+        default: true
+        type: boolean
   push:
     tags:
       - "v*"
@@ -178,6 +183,9 @@ jobs:
 
   publish:
     needs: [build, test, compose-test]
+    # Tag pushes always publish. Manual dispatch publishes unless the
+    # `publish` input is set to false (test-only runs).
+    if: github.event_name != 'workflow_dispatch' || inputs.publish
     runs-on: ubuntu-latest
     permissions:
       contents: read
