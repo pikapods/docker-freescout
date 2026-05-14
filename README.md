@@ -16,6 +16,8 @@ Published to both `ghcr.io/pikapods/docker-freescout:<freescout-version>`
 and `pikapods/docker-freescout:<freescout-version>` (Docker Hub) — pick
 whichever registry you prefer.
 
+Source: https://github.com/pikapods/docker-freescout
+
 ## Why this image
 
 A small, maintainable FreeScout image focused on simplicity: a short
