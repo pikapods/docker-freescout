@@ -71,11 +71,18 @@ RUN cd /var/www/html && (php artisan freescout:build || true)
 # Replace in-source storage, Modules, .env with symlinks into /data.
 # Targets will not resolve until /data is mounted at runtime — fine; the
 # bootstrap script mkdir -p's them on first boot.
+#
+# /data itself must exist and be owned by www-data: the container runs as a
+# non-root user (UID 82 on Alpine) which cannot create /data under /.
 RUN rm -rf /var/www/html/storage /var/www/html/Modules /var/www/html/.env \
     && ln -s /data/storage /var/www/html/storage \
     && ln -s /data/Modules /var/www/html/Modules \
     && ln -s /data/config /var/www/html/.env \
+    && mkdir -p /data \
+    && chown www-data:www-data /data \
     && chown -R www-data:www-data /var/www/html
+
+VOLUME /data
 
 # Overlay our entrypoint hook + s6 scheduler service + nginx site config.
 COPY rootfs/ /

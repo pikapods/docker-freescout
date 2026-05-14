@@ -119,15 +119,12 @@ logs, cache) survives container restarts and image upgrades.
 
 ### User & permissions
 
-Both nginx and php-fpm run as `www-data` (**UID 9999 / GID 9999**), inherited
-from `serversideup/php`. The UID is deliberately offset from the Debian
-default (33) and the Alpine default (82), so it should not collide with a
-host user on most systems.
+Both nginx and php-fpm run as `www-data` (**UID 82 / GID 82** — Alpine's
+default, inherited from `serversideup/php:*-alpine`).
 
-Anything the container writes to `/data` lands as `9999:9999` on the host.
-For rootless podman, map it explicitly with `--userns=keep-id:uid=9999,gid=9999`;
-for rootful runs, `chown -R 9999:9999` on the host volume root before first
-start.
+Anything the container writes to `/data` lands as `82:82` on the host. For
+rootless podman, map it explicitly with `--userns=keep-id:uid=82,gid=82`; for
+rootful runs, `chown -R 82:82` on the host volume root before first start.
 
 ## Ports
 
