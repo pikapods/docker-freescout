@@ -38,7 +38,9 @@ rm -f /data/.write-test
 # 1. Validate required env, map DB_TYPE -> DB_CONNECTION, default DB_PORT.
 # ---------------------------------------------------------------------------
 APP_KEY=${APP_KEY:-}
-: "${APP_URL:?APP_URL is required}"
+# SITE_URL is accepted as a legacy alias for tiredofit drop-in compat.
+APP_URL=${APP_URL:-${SITE_URL:-}}
+: "${APP_URL:?APP_URL (or legacy SITE_URL) is required}"
 : "${DB_HOST:?DB_HOST is required}"
 : "${DB_NAME:?DB_NAME is required}"
 : "${DB_USER:?DB_USER is required}"

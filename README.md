@@ -77,7 +77,7 @@ The compose file and `docker run` examples work as-is under
 
 | Var                   | Required | Purpose                                                              |
 |-----------------------|----------|----------------------------------------------------------------------|
-| `APP_URL`             | yes      | Public URL (no trailing slash).                                      |
+| `APP_URL`             | yes      | Public URL (no trailing slash). Legacy alias `SITE_URL` accepted for tiredofit drop-in compat. |
 | `DB_TYPE`             | yes      | `pgsql` (or `postgres`/`postgresql`), `mysql`, or `mariadb`.         |
 | `DB_HOST`             | yes      | DB hostname.                                                         |
 | `DB_PORT`             | no       | DB port. Defaults to 5432 (pgsql) or 3306 (mysql/mariadb).           |
