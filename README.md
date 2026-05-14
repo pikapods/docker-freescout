@@ -1,12 +1,18 @@
 # docker-freescout
 
-Self-maintained [FreeScout](https://github.com/freescout-helpdesk/freescout)
-container image, built on [`serversideup/php`](https://serversideup.net/open-source/docker-php/).
+[FreeScout](https://github.com/freescout-helpdesk/freescout) container image,
+built on [`serversideup/php`](https://serversideup.net/open-source/docker-php/).
+
+This image powers FreeScout on [PikaPods](https://www.pikapods.com) and is
+maintained by the PikaPods team. It's published here for our users' reference
+and the benefit of the wider community. To run your own FreeScout pod from
+$2.3/month, see
+[pikapods.com/pods?run=freescout](https://www.pikapods.com/pods?run=freescout).
 
 Drop-in compatible with `tiredofit/docker-freescout` on env vars and volume
 layout (modulo the deliberate breaks called out below).
 
-Published as `ghcr.io/pikapods/docker-freescout:<freescout-version>-php<php-version>`.
+Published as `ghcr.io/pikapods/docker-freescout:<freescout-version>`.
 
 ## Why this image
 
