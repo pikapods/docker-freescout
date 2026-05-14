@@ -46,6 +46,17 @@ esac
 DB_PORT=${DB_PORT:-$DB_PORT_DEFAULT}
 
 # ---------------------------------------------------------------------------
+# 1b. Clean up the broken /data/storage/logs symlink left over from old
+#     tiredofit installs (storage/logs -> /logs/laravel/). `mkdir -p` follows
+#     symlinks and fails when the target is missing, killing the container
+#     at boot. Only act on a dangling link; a live symlink stays.
+# ---------------------------------------------------------------------------
+if [ -L /data/storage/logs ] && [ ! -e /data/storage/logs ]; then
+    log "removing broken symlink: /data/storage/logs -> $(readlink /data/storage/logs)"
+    rm -f /data/storage/logs
+fi
+
+# ---------------------------------------------------------------------------
 # 2. Ensure /data tree exists. Idempotent.
 # ---------------------------------------------------------------------------
 mkdir -p \
