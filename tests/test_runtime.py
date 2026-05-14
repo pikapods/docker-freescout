@@ -138,15 +138,18 @@ def test_logs_clean(stack):
 def test_scheduler_longrun_alive(stack):
     # The scheduler longrun is a `while :;` shell loop; the process is
     # always present unless s6 has given up restarting it.
-    # Plain `ps` (no flags) is the BusyBox-safe form — `-ef` is not
-    # portably supported. The `[f]…` bracket trick keeps the grep
-    # process from matching itself without needing `grep -v grep`.
+    # Read /proc/<pid>/cmdline directly — busybox `ps` on Alpine
+    # truncates or omits args for shebang-launched scripts
+    # (`#!/command/with-contenv sh`), so the run-script path doesn't
+    # appear in `ps` output. /proc cmdline is world-readable and
+    # contains the kernel's view of argv with no truncation.
     r = _exec(
         stack["fs"], "sh", "-c",
-        "ps | grep '[f]reescout-scheduler/run'",
+        "cat /proc/[0-9]*/cmdline 2>/dev/null | tr '\\0' '\\n' "
+        "| grep -qF freescout-scheduler/run",
     )
     assert r.returncode == 0, (
-        "scheduler longrun process not found "
+        "scheduler longrun process not present in /proc cmdlines "
         f"(stdout={r.stdout!r}, stderr={r.stderr!r})"
     )
 
