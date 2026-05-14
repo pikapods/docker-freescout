@@ -25,7 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+    outputs:
+      freescout_version: ${{ steps.vars.outputs.freescout_version }}
+      php_version: ${{ steps.vars.outputs.php_version }}
+      image_tag: ${{ steps.vars.outputs.image_tag }}
     steps:
       - uses: actions/checkout@v4
 
@@ -56,65 +59,81 @@ jobs:
           build-args: |
             FREESCOUT_VERSION=${{ steps.vars.outputs.freescout_version }}
             PHP_VERSION=${{ steps.vars.outputs.php_version }}
-          tags: freescout:smoke
+          tags: freescout:test
           provenance: false
 
-      - name: Smoke test
+      - name: Save image tarball
+        run: docker save freescout:test -o /tmp/image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: /tmp/image.tar
+          retention-days: 1
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: image
+          path: /tmp
+
+      - name: Load image
+        run: docker load -i /tmp/image.tar
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test deps
+        run: pip install -r tests/requirements.txt
+
+      - name: Image + runtime tests
+        env:
+          IMAGE: freescout:test
+        run: pytest -v tests/ --junitxml=report.xml
+
+      - name: Dump freescout container logs on failure
+        if: failure()
         run: |
-          set -euo pipefail
-          docker network create fs-smoke
-
-          docker run -d --name pg --network fs-smoke \
-            -e POSTGRES_PASSWORD=test \
-            -e POSTGRES_DB=freescout \
-            postgres:16
-
-          # Wait for Postgres readiness.
-          for _ in $(seq 1 30); do
-            if docker exec pg pg_isready -U postgres >/dev/null 2>&1; then break; fi
-            sleep 1
+          for c in $(docker ps -a --filter "name=^fs-" --format '{{.Names}}'); do
+            echo "--- $c ---"
+            docker logs "$c" 2>&1 || true
           done
 
-          APP_KEY="base64:$(openssl rand -base64 32)"
-          docker run -d --name fs --network fs-smoke \
-            -e APP_KEY="$APP_KEY" \
-            -e APP_URL=http://localhost:8080 \
-            -e DB_TYPE=pgsql \
-            -e DB_HOST=pg \
-            -e DB_NAME=freescout \
-            -e DB_USER=postgres \
-            -e DB_PASS=test \
-            -e ADMIN_EMAIL=admin@smoke.local \
-            -e ADMIN_PASS=changeme \
-            -p 8080:8080 \
-            freescout:smoke
+      - name: Upload pytest report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report
+          path: report.xml
+          retention-days: 7
 
-          # Poll /login for 120s.
-          ok=0
-          for i in $(seq 1 60); do
-            if curl -fsS http://localhost:8080/login -o /dev/null; then
-              ok=1
-              break
-            fi
-            sleep 2
-          done
+  publish:
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
 
-          echo "--- freescout container logs ---"
-          docker logs fs || true
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: image
+          path: /tmp
 
-          if [ "$ok" -ne 1 ]; then
-            echo "ERROR: /login did not return 200 within 120s"
-            exit 1
-          fi
-
-          # Fail on known-bad log patterns.
-          if docker logs fs 2>&1 | grep -E 'RuntimeException|PHP Fatal'; then
-            echo "ERROR: bad pattern in container logs"
-            exit 1
-          fi
-
-          docker rm -f fs pg
-          docker network rm fs-smoke
+      - name: Load image
+        run: docker load -i /tmp/image.tar
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -123,23 +142,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          build-args: |
-            FREESCOUT_VERSION=${{ steps.vars.outputs.freescout_version }}
-            PHP_VERSION=${{ steps.vars.outputs.php_version }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.image_tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          # Push as a Docker-format manifest (not OCI). Reason: podman
-          # currently ignores HEALTHCHECK on OCI-format images. Docker
-          # manifests embed HEALTHCHECK metadata, and every modern registry
-          # + runtime accepts the Docker format.
-          # `provenance: false` skips the SLSA attestation index that would
-          # otherwise force a multi-arch-style manifest list.
-          provenance: false
-          outputs: |
-            type=image,push=true,oci-mediatypes=false
+      # Push three refs:
+      #   <version>-php<minor>   fully qualified (existing)
+      #   <version>              plain FreeScout version alias — resolves to whichever
+      #                          PHP build this run produced (one PHP variant per run today;
+      #                          revisit if multi-PHP fan-out is added)
+      #   latest                 existing
+      #
+      # docker save + docker push preserve the Docker manifest schema (not OCI),
+      # which is what the podman HEALTHCHECK rationale in the Dockerfile depends on.
+      - name: Tag and push
+        env:
+          FS_VER: ${{ needs.build.outputs.freescout_version }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          REPO="${REGISTRY}/${IMAGE_NAME}"
+          docker tag freescout:test "${REPO}:${IMAGE_TAG}"
+          docker tag freescout:test "${REPO}:${FS_VER}"
+          docker tag freescout:test "${REPO}:latest"
+          docker push "${REPO}:${IMAGE_TAG}"
+          docker push "${REPO}:${FS_VER}"
+          docker push "${REPO}:latest"

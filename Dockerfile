@@ -16,7 +16,8 @@ ARG FREESCOUT_REPO=https://github.com/freescout-helpdesk/freescout
 LABEL org.opencontainers.image.title="FreeScout" \
       org.opencontainers.image.description="Self-maintained FreeScout container" \
       org.opencontainers.image.source="https://github.com/pikapods/docker-freescout" \
-      org.opencontainers.image.licenses="AGPL-3.0"
+      org.opencontainers.image.licenses="AGPL-3.0" \
+      org.opencontainers.image.version="${FREESCOUT_VERSION}"
 
 USER root
 
