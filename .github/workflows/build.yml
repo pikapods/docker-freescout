@@ -222,7 +222,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Push three refs:
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Push three refs to each registry:
       #   <version>-php<minor>   fully qualified (existing)
       #   <version>              plain FreeScout version alias — resolves to whichever
       #                          PHP build this run produced (one PHP variant per run today;
@@ -235,12 +241,14 @@ jobs:
         env:
           FS_VER: ${{ needs.build.outputs.freescout_version }}
           IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/docker-freescout
         run: |
           set -euo pipefail
-          REPO="${REGISTRY}/${IMAGE_NAME}"
-          docker tag freescout:test "${REPO}:${IMAGE_TAG}"
-          docker tag freescout:test "${REPO}:${FS_VER}"
-          docker tag freescout:test "${REPO}:latest"
-          docker push "${REPO}:${IMAGE_TAG}"
-          docker push "${REPO}:${FS_VER}"
-          docker push "${REPO}:latest"
+          for REPO in "${REGISTRY}/${IMAGE_NAME}" "docker.io/${DOCKERHUB_REPO}"; do
+            docker tag freescout:test "${REPO}:${IMAGE_TAG}"
+            docker tag freescout:test "${REPO}:${FS_VER}"
+            docker tag freescout:test "${REPO}:latest"
+            docker push "${REPO}:${IMAGE_TAG}"
+            docker push "${REPO}:${FS_VER}"
+            docker push "${REPO}:latest"
+          done

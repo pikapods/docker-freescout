@@ -12,7 +12,9 @@ $2.3/month, see
 Drop-in compatible with `tiredofit/docker-freescout` on env vars and volume
 layout (modulo the deliberate breaks called out below).
 
-Published as `ghcr.io/pikapods/docker-freescout:<freescout-version>`.
+Published to both `ghcr.io/pikapods/docker-freescout:<freescout-version>`
+and `pikapods/docker-freescout:<freescout-version>` (Docker Hub) — pick
+whichever registry you prefer.
 
 ## Why this image
 
