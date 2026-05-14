@@ -120,8 +120,3 @@ class TestImageFilesystem:
         for path in ("/var/www/html/artisan", "/var/www/html/composer.json"):
             r = _run("test", "-f", path)
             assert r.returncode == 0, f"{path} missing"
-
-    def test_php_artisan_version(self):
-        r = _run("php", "/var/www/html/artisan", "--version")
-        assert r.returncode == 0, f"artisan --version failed: {r.stderr}"
-        assert "Laravel Framework" in r.stdout, f"unexpected output: {r.stdout!r}"

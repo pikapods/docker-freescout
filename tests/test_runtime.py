@@ -16,6 +16,12 @@ IMAGE = os.environ["IMAGE"]
 READY_DEADLINE_S = 180
 HEALTHY_DEADLINE_S = 90
 
+# FreeScout/Laravel rejects requests whose Host header does not match APP_URL
+# with a 403. The fixture passes APP_URL=http://localhost:8080, so every test
+# request must declare Host: localhost:8080 — the random host port we bind to
+# is only the TCP destination.
+APP_HOST_HEADER = "localhost:8080"
+
 
 def _sh(*args, check=True, capture=True):
     return subprocess.run(
@@ -40,12 +46,17 @@ def _wait_pg_ready(container, deadline_s=30):
     raise RuntimeError(f"postgres container {container} not ready within {deadline_s}s")
 
 
+def _http_get(url, timeout=10):
+    req = urllib.request.Request(url, headers={"Host": APP_HOST_HEADER})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
 def _wait_http_200(url, deadline_s):
     end = time.time() + deadline_s
     last_err = None
     while time.time() < end:
         try:
-            with urllib.request.urlopen(url, timeout=5) as r:
+            with _http_get(url, timeout=5) as r:
                 if r.status == 200:
                     return
                 last_err = f"status={r.status}"
@@ -110,7 +121,7 @@ def stack():
 
 
 def test_login_responds_200(stack):
-    with urllib.request.urlopen(f"http://127.0.0.1:{stack['port']}/login", timeout=10) as r:
+    with _http_get(f"http://127.0.0.1:{stack['port']}/login") as r:
         assert r.status == 200
         body = r.read().decode("utf-8", errors="replace")
     # Cheap content sanity — FreeScout's login template renders a password field.
