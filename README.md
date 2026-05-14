@@ -64,8 +64,9 @@ The compose file and `docker run` examples work as-is under
   manifests, which silently drop the `HEALTHCHECK` instruction; docker
   format embeds it.
 - **Rootless permissions:** rootless podman remaps UIDs, so the
-  container's `www-data` (UID 82) isn't host UID 82. Map explicitly:
+  container's `www-data` (UID 82) isn't host UID 82. For bind mounts, add
   `--userns=keep-id:uid=82,gid=82`. Rootful podman behaves like docker.
+  Full decision matrix in [User & permissions](#user--permissions).
 - **Healthcheck inspection:** `podman healthcheck run <container>` runs
   the check on demand. Docker runs it automatically; inspect with
   `docker inspect --format '{{.State.Health.Status}}' <container>`.
@@ -156,13 +157,28 @@ logs, cache) survives container restarts and image upgrades.
 ### User & permissions
 
 Both nginx and php-fpm run as `www-data` (**UID 82 / GID 82** — Alpine's
-default, inherited from `serversideup/php:*-alpine`).
+default, inherited from `serversideup/php:*-alpine`). Anything the container
+writes to `/data` lands as `82:82` on the host. Pick the row that matches
+your setup:
 
-Anything the container writes to `/data` lands as `82:82` on the host.
-Bind-mount targets need `chown -R 82:82` on the host before first start;
-named volumes (including the ones in `compose.yaml`) are daemon-owned and
-need no setup. Rootless podman additionally needs
-`--userns=keep-id:uid=82,gid=82` — see the podman notes in Quick start.
+| Setup                                          | What to do                                                                                                   |
+|------------------------------------------------|--------------------------------------------------------------------------------------------------------------|
+| Named volume (docker or podman)                | Nothing — daemon manages ownership. Default in `compose.yaml`.                                               |
+| Bind mount, rootful docker                     | `chown -R 82:82 <host-dir>` before first boot.                                                               |
+| Bind mount, rootless podman                    | Add `--userns=keep-id:uid=82,gid=82` to `podman run`.                                                        |
+| Need files owned by your host UID without remap | Rebuild: `docker build --build-arg WWW_DATA_UID=$(id -u) --build-arg WWW_DATA_GID=$(id -g) -t freescout:local .` |
+
+The bootstrap runs a preflight writability check on `/data` and refuses to
+start with a readable error if ownership is wrong, rather than failing
+cryptically deep in `mkdir`.
+
+Why not a runtime `PUID`/`PGID` env var? Upstream `serversideup/php` v3
+[deliberately removed root from the boot path](https://github.com/serversideup/docker-php/issues/253),
+and runtime UID remap requires reintroducing it. The supported lever is the
+build-time `WWW_DATA_UID`/`WWW_DATA_GID` rebuild above. Note that docker's
+`userns-remap` is daemon-wide and maps to a subordinate UID range, so it
+*worsens* bind-mount UX rather than fixing it — there is no rootful-docker
+runtime trick equivalent to podman's `--userns=keep-id`.
 
 ## Ports
 

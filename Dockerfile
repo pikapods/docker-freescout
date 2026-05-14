@@ -83,6 +83,17 @@ RUN rm -rf /var/www/html/storage /var/www/html/Modules /var/www/html/.env \
     && chown www-data:www-data /data \
     && chown -R www-data:www-data /var/www/html
 
+# Build-arg UID/GID override. The base image fixes www-data at 82:82; rebuild
+# with --build-arg WWW_DATA_UID=$(id -u) --build-arg WWW_DATA_GID=$(id -g) for
+# bind-mount UX without host-side chown. Guarded so the default-build path
+# adds no extra layer work. See README "User & permissions".
+ARG WWW_DATA_UID=82
+ARG WWW_DATA_GID=82
+RUN if [ "$WWW_DATA_UID" != "82" ] || [ "$WWW_DATA_GID" != "82" ]; then \
+        docker-php-serversideup-set-id www-data "${WWW_DATA_UID}:${WWW_DATA_GID}" \
+     && docker-php-serversideup-set-file-permissions --owner "${WWW_DATA_UID}:${WWW_DATA_GID}"; \
+    fi
+
 VOLUME /data
 
 # Overlay our entrypoint hook + s6 scheduler service + nginx site config.

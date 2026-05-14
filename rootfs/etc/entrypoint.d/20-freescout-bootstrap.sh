@@ -18,6 +18,22 @@ if [ -d /data/config ]; then
     exit 1
 fi
 
+# Preflight writability check. Without this, an unchowned bind-mount surfaces
+# as a bare `mkdir: Permission denied` deep in the boot sequence and the
+# container crash-loops with no actionable hint. Use redirection rather than
+# `touch` so a pre-existing unwritable `.write-test` still trips the guard.
+if ! ( : > /data/.write-test ) 2>/dev/null; then
+    cat >&2 <<EOF
+ERROR: /data is not writable by UID:GID $(id -u):$(id -g).
+       Bind-mount target ownership must match the container's www-data user.
+       Fix on host:    chown -R $(id -u):$(id -g) <host-bind-mount-path>
+       Alternatives:   named volume; podman --userns=keep-id:uid=$(id -u),gid=$(id -g);
+                       rebuild with --build-arg WWW_DATA_UID=...
+EOF
+    exit 1
+fi
+rm -f /data/.write-test
+
 # ---------------------------------------------------------------------------
 # 1. Validate required env, map DB_TYPE -> DB_CONNECTION, default DB_PORT.
 # ---------------------------------------------------------------------------
