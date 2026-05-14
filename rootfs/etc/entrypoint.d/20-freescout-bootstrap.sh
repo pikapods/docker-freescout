@@ -21,7 +21,7 @@ fi
 # ---------------------------------------------------------------------------
 # 1. Validate required env, map DB_TYPE -> DB_CONNECTION, default DB_PORT.
 # ---------------------------------------------------------------------------
-: "${APP_KEY:?APP_KEY is required}"
+APP_KEY=${APP_KEY:-}
 : "${APP_URL:?APP_URL is required}"
 : "${DB_HOST:?DB_HOST is required}"
 : "${DB_NAME:?DB_NAME is required}"
@@ -119,8 +119,25 @@ if [ ! -f "$ENV_FILE" ]; then
     : > "$ENV_FILE"
 fi
 
-# Ops-managed keys: always set, sentinels do NOT apply.
-write_env_key APP_KEY        "$APP_KEY"        "$ENV_FILE"
+# APP_KEY resolution: env override -> existing /data/config value -> generate.
+# write_env_key only runs in the override branch so we don't clobber a
+# Laravel-written value on subsequent boots.
+existing_app_key=$(awk -F= '/^APP_KEY=/ { sub(/^APP_KEY=/,""); v=$0 } END { print v }' "$ENV_FILE")
+
+if [ -n "$APP_KEY" ]; then
+    write_env_key APP_KEY "$APP_KEY" "$ENV_FILE"
+elif [ -n "$existing_app_key" ]; then
+    log "APP_KEY: using existing value from $ENV_FILE"
+else
+    log "APP_KEY: generating via php artisan key:generate"
+    # key:generate uses preg_replace on an existing APP_KEY= line; seed an
+    # empty one if missing so the substitution lands.
+    grep -q '^APP_KEY=' "$ENV_FILE" || printf 'APP_KEY=\n' >> "$ENV_FILE"
+    ( cd "$APP_DIR" && php artisan key:generate --force --no-interaction ) >&2 \
+        || die "php artisan key:generate failed"
+fi
+
+# Ops-managed keys: always set from env, sentinels do NOT apply.
 write_env_key APP_URL        "$APP_URL"        "$ENV_FILE"
 write_env_key DB_CONNECTION  "$DB_CONNECTION"  "$ENV_FILE"
 write_env_key DB_HOST        "$DB_HOST"        "$ENV_FILE"

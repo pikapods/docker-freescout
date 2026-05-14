@@ -120,6 +120,77 @@ def stack():
         subprocess.run(["docker", "network", "rm", net], capture_output=True)
 
 
+@pytest.fixture(scope="session")
+def stack_no_appkey():
+    suffix = secrets.token_hex(4)
+    net = f"fs-net-{suffix}"
+    pg = f"pg-{suffix}"
+    fs = f"fs-{suffix}"
+    vol = f"fs-data-{suffix}"
+
+    _sh("docker", "network", "create", net)
+    _sh("docker", "volume", "create", vol)
+    try:
+        _sh(
+            "docker", "run", "-d", "--name", pg, "--network", net,
+            "-e", "POSTGRES_PASSWORD=test",
+            "-e", "POSTGRES_DB=freescout",
+            "postgres:16",
+        )
+        _wait_pg_ready(pg)
+
+        _sh(
+            "docker", "run", "-d", "--name", fs, "--network", net,
+            "-e", "APP_URL=http://localhost:8080",
+            "-e", "DB_TYPE=pgsql",
+            "-e", f"DB_HOST={pg}",
+            "-e", "DB_NAME=freescout",
+            "-e", "DB_USER=postgres",
+            "-e", "DB_PASS=test",
+            "-e", "ADMIN_EMAIL=admin@smoke.local",
+            "-e", "ADMIN_PASS=changeme",
+            "-v", f"{vol}:/data",
+            "-p", "0:8080",
+            IMAGE,
+        )
+        port = _host_port(fs, "8080")
+        try:
+            _wait_http_200(f"http://127.0.0.1:{port}/login", READY_DEADLINE_S)
+        except RuntimeError:
+            print(_sh("docker", "logs", fs, check=False).stdout)
+            print(_sh("docker", "logs", fs, check=False).stderr)
+            raise
+
+        yield {"fs": fs, "pg": pg, "net": net, "port": port, "vol": vol}
+    finally:
+        for name in (fs, pg):
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        subprocess.run(["docker", "network", "rm", net], capture_output=True)
+        subprocess.run(["docker", "volume", "rm", vol], capture_output=True)
+
+
+def _read_app_key(container):
+    r = _exec(container, "grep", "-E", "^APP_KEY=", "/data/config")
+    assert r.returncode == 0, f"APP_KEY missing from /data/config (stderr={r.stderr!r})"
+    return r.stdout.strip()
+
+
+def test_app_key_generated_in_env_file(stack_no_appkey):
+    r = _exec(stack_no_appkey["fs"], "grep", "-E", "^APP_KEY=.+", "/data/config")
+    assert r.returncode == 0, "APP_KEY= line is missing or empty in /data/config"
+    value = r.stdout.strip().split("=", 1)[1]
+    assert value, "APP_KEY value is empty"
+
+
+def test_app_key_stable_across_restart(stack_no_appkey):
+    fs = stack_no_appkey["fs"]
+    key1 = _read_app_key(fs)
+    _sh("docker", "restart", fs)
+    _wait_http_200(f"http://127.0.0.1:{stack_no_appkey['port']}/login", READY_DEADLINE_S)
+    key2 = _read_app_key(fs)
+    assert key1 == key2, f"APP_KEY changed across restart: {key1!r} -> {key2!r}"
+
+
 def test_login_responds_200(stack):
     with _http_get(f"http://127.0.0.1:{stack['port']}/login") as r:
         assert r.status == 200

@@ -27,7 +27,6 @@ deployments can switch by changing only the image tag.
 ```bash
 podman run -d --name freescout \
   -v freescout-data:/data \
-  -e APP_KEY="base64:$(openssl rand -base64 32)" \
   -e APP_URL="https://support.example.com" \
   -e DB_TYPE=pgsql \
   -e DB_HOST=db.internal \
@@ -46,7 +45,7 @@ podman run -d --name freescout \
 
 | Var                   | Required | Purpose                                                              |
 |-----------------------|----------|----------------------------------------------------------------------|
-| `APP_KEY`             | yes      | Laravel encryption key. Must be preserved across restarts.           |
+| `APP_KEY`             | no       | Laravel encryption key. Generated and persisted to `/data/config` on first boot. Pass `-e APP_KEY=…` only if you need to manage it externally (e.g. from a secret store); the image accepts whatever Laravel accepts. Once set, **do not change or remove it** — Laravel and FreeScout use it to decrypt sessions and encrypted columns; rotating it invalidates that data. |
 | `APP_URL`             | yes      | Public URL (no trailing slash).                                      |
 | `DB_TYPE`             | yes      | `pgsql` (or `postgres`/`postgresql`), `mysql`, or `mariadb`.         |
 | `DB_HOST`             | yes      | DB hostname.                                                         |
@@ -143,11 +142,19 @@ exposure if you're not using a proxy.
 
 ## `.env` ownership model
 
-`/data/config` is **user state**, not a regenerated artifact. Each boot:
+`/data/config` is **user state**, not a regenerated artifact.
 
-1. The image **always overwrites** a small set of ops-managed keys: `APP_KEY`,
-   `APP_URL`, `DB_CONNECTION`, `DB_HOST`, `DB_PORT`, `DB_DATABASE`,
-   `DB_USERNAME`, `DB_PASSWORD`.
+`APP_KEY` is resolved with a three-way fallback: an `APP_KEY` env var wins
+(operator override); otherwise an existing non-empty value in `/data/config`
+is preserved; otherwise the image generates one via `php artisan key:generate`
+and persists it. Once written, `APP_KEY` is treated as immutable user state —
+rotating it invalidates encrypted sessions and DB columns.
+
+Each boot:
+
+1. The image **always overwrites** a small set of ops-managed keys from the
+   environment: `APP_URL`, `DB_CONNECTION`, `DB_HOST`, `DB_PORT`,
+   `DB_DATABASE`, `DB_USERNAME`, `DB_PASSWORD`.
 2. Any `FREESCOUT_*` env vars are **patched in** (set-through-once — see
    above).
 3. **Everything else in the file is preserved untouched.** Hand-edits via
@@ -210,7 +217,6 @@ podman network create fs-smoke
 podman run -d --name pg --network fs-smoke \
   -e POSTGRES_PASSWORD=test -e POSTGRES_DB=freescout postgres:16
 podman run -d --name fs --network fs-smoke \
-  -e APP_KEY="base64:$(openssl rand -base64 32)" \
   -e APP_URL=http://localhost:8080 \
   -e DB_TYPE=pgsql -e DB_HOST=pg -e DB_NAME=freescout \
   -e DB_USER=postgres -e DB_PASS=test \
