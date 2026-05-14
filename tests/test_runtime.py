@@ -186,7 +186,15 @@ def test_app_key_stable_across_restart(stack_no_appkey):
     fs = stack_no_appkey["fs"]
     key1 = _read_app_key(fs)
     _sh("docker", "restart", fs)
-    _wait_http_200(f"http://127.0.0.1:{stack_no_appkey['port']}/login", READY_DEADLINE_S)
+    # `-p 0:8080` makes the host port ephemeral; Docker may reassign it on
+    # restart, so re-query rather than reusing the fixture's pre-restart port.
+    port = _host_port(fs, "8080")
+    try:
+        _wait_http_200(f"http://127.0.0.1:{port}/login", READY_DEADLINE_S)
+    except RuntimeError:
+        print(_sh("docker", "logs", fs, check=False).stdout)
+        print(_sh("docker", "logs", fs, check=False).stderr)
+        raise
     key2 = _read_app_key(fs)
     assert key1 == key2, f"APP_KEY changed across restart: {key1!r} -> {key2!r}"
 
