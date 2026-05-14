@@ -120,3 +120,55 @@ class TestImageFilesystem:
         for path in ("/var/www/html/artisan", "/var/www/html/composer.json"):
             r = _run("test", "-f", path)
             assert r.returncode == 0, f"{path} missing"
+
+
+# Marked runtime: a full image rebuild (~30s with buildkit cache, minutes
+# cold). Lives outside TestImageFilesystem so `-m 'not runtime'` keeps the
+# fast image lane fast.
+@pytest.mark.runtime
+class TestCustomUidRebuild:
+    """Rebuild with --build-arg WWW_DATA_UID/GID and verify the new UID
+    actually owns /data. Regression guard: set-file-permissions only touches
+    a hardcoded path list, so /data needs an explicit chown in the Dockerfile
+    or the rebuilt image's www-data can't write to its own volume.
+    """
+
+    UID = "1000"
+    GID = "1000"
+
+    @pytest.fixture(scope="class")
+    def image(self):
+        ctx = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        tag = f"fs-uid{self.UID}-test"
+        r = subprocess.run(
+            ["docker", "build",
+             "--build-arg", f"WWW_DATA_UID={self.UID}",
+             "--build-arg", f"WWW_DATA_GID={self.GID}",
+             "-t", tag, ctx],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            pytest.fail(
+                f"docker build failed (rc={r.returncode})\n"
+                f"--- stdout ---\n{r.stdout}\n--- stderr ---\n{r.stderr}"
+            )
+        try:
+            yield tag
+        finally:
+            subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
+
+    def test_www_data_user_remapped(self, image):
+        r = subprocess.run(
+            ["docker", "run", "--rm", "--entrypoint=", image,
+             "id", "-u", "www-data"],
+            capture_output=True, text=True, check=True,
+        )
+        assert r.stdout.strip() == self.UID
+
+    def test_data_dir_remapped(self, image):
+        r = subprocess.run(
+            ["docker", "run", "--rm", "--entrypoint=", image,
+             "stat", "-c", "%u:%g", "/data"],
+            capture_output=True, text=True, check=True,
+        )
+        assert r.stdout.strip() == f"{self.UID}:{self.GID}"

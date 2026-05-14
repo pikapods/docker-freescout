@@ -91,7 +91,8 @@ ARG WWW_DATA_UID=82
 ARG WWW_DATA_GID=82
 RUN if [ "$WWW_DATA_UID" != "82" ] || [ "$WWW_DATA_GID" != "82" ]; then \
         docker-php-serversideup-set-id www-data "${WWW_DATA_UID}:${WWW_DATA_GID}" \
-     && docker-php-serversideup-set-file-permissions --owner "${WWW_DATA_UID}:${WWW_DATA_GID}"; \
+     && docker-php-serversideup-set-file-permissions --owner "${WWW_DATA_UID}:${WWW_DATA_GID}" \
+     && chown "${WWW_DATA_UID}:${WWW_DATA_GID}" /data; \
     fi
 
 VOLUME /data

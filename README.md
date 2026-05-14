@@ -157,16 +157,15 @@ logs, cache) survives container restarts and image upgrades.
 ### User & permissions
 
 Both nginx and php-fpm run as `www-data` (**UID 82 / GID 82** — Alpine's
-default, inherited from `serversideup/php:*-alpine`). Anything the container
-writes to `/data` lands as `82:82` on the host. Pick the row that matches
-your setup:
+default, inherited from `serversideup/php:*-alpine`). How those writes
+surface on the host depends on your runtime; pick the row that matches:
 
-| Setup                                          | What to do                                                                                                   |
-|------------------------------------------------|--------------------------------------------------------------------------------------------------------------|
-| Named volume (docker or podman)                | Nothing — daemon manages ownership. Default in `compose.yaml`.                                               |
-| Bind mount, rootful docker                     | `chown -R 82:82 <host-dir>` before first boot.                                                               |
-| Bind mount, rootless podman                    | Add `--userns=keep-id:uid=82,gid=82` to `podman run`.                                                        |
-| Need files owned by your host UID without remap | Rebuild: `docker build --build-arg WWW_DATA_UID=$(id -u) --build-arg WWW_DATA_GID=$(id -g) -t freescout:local .` |
+| Setup                                  | What to do                                                                                                   | Host-side ownership of `/data` writes |
+|----------------------------------------|--------------------------------------------------------------------------------------------------------------|---------------------------------------|
+| Named volume (docker or podman)        | Nothing — daemon manages ownership. Default in `compose.yaml`.                                               | Inside daemon-managed volume; not user-visible. |
+| Bind mount, rootful docker/podman      | `chown -R 82:82 <host-dir>` before first boot.                                                               | `82:82`.                              |
+| Bind mount, rootless podman            | Add `--userns=keep-id:uid=82,gid=82` to `podman run`.                                                        | Invoking host user's UID/GID.         |
+| Custom-UID rebuild                     | `docker build --build-arg WWW_DATA_UID=$(id -u) --build-arg WWW_DATA_GID=$(id -g) -t freescout:local .`      | The UID baked at build time.          |
 
 The bootstrap runs a preflight writability check on `/data` and refuses to
 start with a readable error if ownership is wrong, rather than failing

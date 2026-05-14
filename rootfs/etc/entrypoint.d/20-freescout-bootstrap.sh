@@ -24,11 +24,13 @@ fi
 # `touch` so a pre-existing unwritable `.write-test` still trips the guard.
 if ! ( : > /data/.write-test ) 2>/dev/null; then
     cat >&2 <<EOF
-ERROR: /data is not writable by UID:GID $(id -u):$(id -g).
-       Bind-mount target ownership must match the container's www-data user.
-       Fix on host:    chown -R $(id -u):$(id -g) <host-bind-mount-path>
-       Alternatives:   named volume; podman --userns=keep-id:uid=$(id -u),gid=$(id -g);
-                       rebuild with --build-arg WWW_DATA_UID=...
+ERROR: /data is not writable by the container (container UID:GID $(id -u):$(id -g)).
+       Ownership of the bind-mount target must match how the container sees it.
+       The right fix depends on your runtime — see README "User & permissions":
+         - rootful docker/podman bind mount: chown the host dir to $(id -u):$(id -g)
+         - rootless podman: add --userns=keep-id:uid=$(id -u),gid=$(id -g)
+         - or use a named volume
+         - or rebuild with --build-arg WWW_DATA_UID=...
 EOF
     exit 1
 fi
