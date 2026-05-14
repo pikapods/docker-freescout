@@ -158,10 +158,23 @@ jobs:
           exit 1
 
       - name: Assert healthcheck propagated
+        # Dockerfile HEALTHCHECK has interval=30s, so status stays `starting`
+        # until the first probe fires. Poll up to ~90s.
         run: |
-          status=$(docker inspect --format '{{.State.Health.Status}}' freescout-freescout-1)
-          echo "health status: $status"
-          [ "$status" = "healthy" ] || exit 1
+          for i in $(seq 1 18); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' freescout-freescout-1)
+            echo "health status: $status"
+            if [ "$status" = "healthy" ]; then
+              exit 0
+            fi
+            if [ "$status" = "unhealthy" ]; then
+              echo "container reported unhealthy"
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "timed out waiting for healthy status"
+          exit 1
 
       - name: Assert clean first boot
         run: |
