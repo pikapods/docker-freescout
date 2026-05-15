@@ -87,6 +87,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh workflow run build.yml \
+            --repo '${{ github.repository }}' \
             -f freescout_version='${{ steps.check.outputs.upstream }}' \
             -f php_version='${{ env.PHP_VERSION }}' \
             -f base_digest='${{ steps.check.outputs.base_digest }}'
