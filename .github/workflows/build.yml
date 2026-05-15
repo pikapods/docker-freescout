@@ -12,6 +12,16 @@ on:
         required: false
         default: "8.4"
         type: string
+      base_digest:
+        description: "Base image digest (sha256:...). Leave blank to resolve at build time."
+        required: false
+        default: ""
+        type: string
+      revision:
+        description: "Image revision (e.g. r1). Leave blank to compute from registry."
+        required: false
+        default: ""
+        type: string
       publish:
         description: "Publish to GHCR after tests pass"
         required: false
@@ -25,6 +35,12 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# Serialize builds so revision computation (read :<ver> label → bump -rN)
+# can't race. We only ever build one version at a time in practice.
+concurrency:
+  group: build
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -33,7 +49,8 @@ jobs:
     outputs:
       freescout_version: ${{ steps.vars.outputs.freescout_version }}
       php_version: ${{ steps.vars.outputs.php_version }}
-      image_tag: ${{ steps.vars.outputs.image_tag }}
+      image_revision: ${{ steps.rev.outputs.revision }}
+      base_digest: ${{ steps.base.outputs.digest }}
     steps:
       - uses: actions/checkout@v6
 
@@ -50,7 +67,70 @@ jobs:
           fi
           echo "freescout_version=$FS_VER" >>"$GITHUB_OUTPUT"
           echo "php_version=$PHP_VER"      >>"$GITHUB_OUTPUT"
-          echo "image_tag=${FS_VER}-php${PHP_VER}" >>"$GITHUB_OUTPUT"
+
+      - uses: imjasonh/setup-crane@v0.4
+
+      # Pin the base image to a digest so the build is reproducible and the
+      # base.digest label reflects exactly what we built against. Caller can
+      # pass it in (the upstream-watch workflow does); otherwise resolve here.
+      - name: Resolve base image digest
+        id: base
+        env:
+          INPUT_DIGEST: ${{ inputs.base_digest }}
+          PHP_VER: ${{ steps.vars.outputs.php_version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_DIGEST:-}" ]; then
+            digest="${INPUT_DIGEST}"
+            echo "using digest from input: ${digest}"
+          else
+            digest=$(crane digest "serversideup/php:${PHP_VER}-fpm-nginx-alpine")
+            echo "resolved digest: ${digest}"
+          fi
+          echo "digest=${digest}" >>"$GITHUB_OUTPUT"
+
+      # Compute the next -rN by reading the version label off the mutable
+      # <FS_VER> tag. First build of a FreeScout version → tag absent → r1.
+      # Existing tag → parse trailing -rN and bump. Caller can override via
+      # the `revision` input.
+      - name: Compute image revision
+        id: rev
+        env:
+          INPUT_REVISION: ${{ inputs.revision }}
+          FS_VER: ${{ steps.vars.outputs.freescout_version }}
+          REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_REVISION:-}" ]; then
+            revision="${INPUT_REVISION}"
+            echo "using revision from input: ${revision}"
+          else
+            cfg=$(crane config "${REF}:${FS_VER}" 2>/dev/null || true)
+            if [ -z "${cfg}" ]; then
+              revision="r1"
+              echo "no existing :${FS_VER} tag; starting at r1"
+            else
+              prev=$(echo "${cfg}" | jq -r '.config.Labels["org.opencontainers.image.version"] // empty')
+              prev_rev="${prev##*-}"
+              case "${prev_rev}" in
+                r[0-9]*)
+                  next=$(( ${prev_rev#r} + 1 ))
+                  revision="r${next}"
+                  echo "previous label '${prev}' → next revision ${revision}"
+                  ;;
+                *)
+                  # Pre-revision-scheme image (label has no -rN suffix).
+                  revision="r1"
+                  echo "previous label '${prev}' has no -rN suffix; starting at r1"
+                  ;;
+              esac
+            fi
+          fi
+          echo "revision=${revision}" >>"$GITHUB_OUTPUT"
+
+      - name: Compute build date
+        id: meta
+        run: echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
@@ -64,6 +144,11 @@ jobs:
           build-args: |
             FREESCOUT_VERSION=${{ steps.vars.outputs.freescout_version }}
             PHP_VERSION=${{ steps.vars.outputs.php_version }}
+            BASE_IMAGE=serversideup/php@${{ steps.base.outputs.digest }}
+            BASE_DIGEST=${{ steps.base.outputs.digest }}
+            IMAGE_REVISION=${{ steps.rev.outputs.revision }}
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
           tags: freescout:test
           provenance: false
 
@@ -229,26 +314,24 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # Push three refs to each registry:
-      #   <version>-php<minor>   fully qualified (existing)
-      #   <version>              plain FreeScout version alias — resolves to whichever
-      #                          PHP build this run produced (one PHP variant per run today;
-      #                          revisit if multi-PHP fan-out is added)
-      #   latest                 existing
+      #   <version>-r<n>   immutable — this exact build, never reused
+      #   <version>        mutable — points at the latest revision of this FreeScout version
+      #   latest           mutable — most recent build overall
       #
       # docker save + docker push preserve the Docker manifest schema (not OCI),
       # which is what the podman HEALTHCHECK rationale in the Dockerfile depends on.
       - name: Tag and push
         env:
           FS_VER: ${{ needs.build.outputs.freescout_version }}
-          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          REVISION: ${{ needs.build.outputs.image_revision }}
           DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/docker-freescout
         run: |
           set -euo pipefail
           for REPO in "${REGISTRY}/${IMAGE_NAME}" "docker.io/${DOCKERHUB_REPO}"; do
-            docker tag freescout:test "${REPO}:${IMAGE_TAG}"
+            docker tag freescout:test "${REPO}:${FS_VER}-${REVISION}"
             docker tag freescout:test "${REPO}:${FS_VER}"
             docker tag freescout:test "${REPO}:latest"
-            docker push "${REPO}:${IMAGE_TAG}"
+            docker push "${REPO}:${FS_VER}-${REVISION}"
             docker push "${REPO}:${FS_VER}"
             docker push "${REPO}:latest"
           done

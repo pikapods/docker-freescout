@@ -12,11 +12,19 @@ $2.3/month, see
 Drop-in compatible with `tiredofit/docker-freescout` on env vars and volume
 layout (modulo the deliberate breaks called out below).
 
-Published to both `ghcr.io/pikapods/docker-freescout:<freescout-version>`
-and `pikapods/docker-freescout:<freescout-version>` (Docker Hub) — pick
-whichever registry you prefer.
+Published to both `ghcr.io/pikapods/docker-freescout` and
+`pikapods/docker-freescout` (Docker Hub) — pick whichever registry you
+prefer. See [Tags](#tags) for the available tag scheme.
 
 Source: https://github.com/pikapods/docker-freescout
+
+## Tags
+
+| Tag                 | Mutability | Use for                                                                 |
+|---------------------|------------|-------------------------------------------------------------------------|
+| `latest`            | mutable    | Tracks the newest build in the pinned upstream series.                  |
+| `<version>`         | mutable    | e.g. `1.8.219`. Latest revision of that FreeScout version (gets base-image security rebuilds in place). |
+| `<version>-r<n>`    | immutable  | e.g. `1.8.219-r2`. Exact build, never reused. Pin here for reproducible deploys. |
 
 ## Why this image
 

@@ -5,19 +5,38 @@
 #   podman build \
 #     --build-arg FREESCOUT_VERSION=1.8.219 \
 #     --build-arg PHP_VERSION=8.4 \
-#     -t ghcr.io/pikapods/docker-freescout:1.8.219-php8.4 .
+#     -t ghcr.io/pikapods/docker-freescout:1.8.219 .
+#
+# CI also passes BASE_IMAGE (digest-pinned), BASE_DIGEST, IMAGE_REVISION,
+# GIT_SHA, and BUILD_DATE to populate OCI labels and pin the base. Local
+# builds work without them via the defaults.
 
 ARG PHP_VERSION=8.4
-FROM serversideup/php:${PHP_VERSION}-fpm-nginx-alpine
+# BASE_IMAGE lets CI pin to a digest (serversideup/php@sha256:...) so the build
+# is reproducible and we can label the exact base used. Local `podman build .`
+# falls back to the tag-based default.
+ARG BASE_IMAGE=serversideup/php:${PHP_VERSION}-fpm-nginx-alpine
+FROM ${BASE_IMAGE}
 
+# Re-declare PHP_VERSION post-FROM so it's visible to LABEL below.
+ARG PHP_VERSION
 ARG FREESCOUT_VERSION=1.8.219
 ARG FREESCOUT_REPO=https://github.com/freescout-helpdesk/freescout
+# Build-identity args populated by CI. Defaults keep local builds working.
+ARG IMAGE_REVISION=r1
+ARG BASE_DIGEST=
+ARG GIT_SHA=
+ARG BUILD_DATE=
 
 LABEL org.opencontainers.image.title="FreeScout" \
       org.opencontainers.image.description="Self-maintained FreeScout container" \
       org.opencontainers.image.source="https://github.com/pikapods/docker-freescout" \
       org.opencontainers.image.licenses="AGPL-3.0" \
-      org.opencontainers.image.version="${FREESCOUT_VERSION}"
+      org.opencontainers.image.version="${FREESCOUT_VERSION}-${IMAGE_REVISION}" \
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.base.name="serversideup/php:${PHP_VERSION}-fpm-nginx-alpine" \
+      org.opencontainers.image.base.digest="${BASE_DIGEST}"
 
 USER root
 
