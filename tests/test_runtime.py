@@ -346,10 +346,15 @@ def test_healthcheck_reports_healthy(stack):
 
 @pytest.fixture(scope="session")
 def stack_public_url():
-    # Mirrors `stack` but with a non-localhost APP_URL. Pins down that the
-    # healthcheck doesn't depend on operators setting APP_URL=http://localhost:...,
-    # since FreeScout's TrustHosts middleware would otherwise 403 the loopback
-    # probe (see rootfs/usr/local/bin/freescout-healthcheck).
+    # Mirrors `stack` but with a non-localhost APP_URL — the case operators
+    # actually run in. Pins down that the loopback healthcheck doesn't depend
+    # on APP_URL=http://localhost:..., which would otherwise be the only way
+    # to satisfy FreeScout's TrustHosts middleware
+    # (see rootfs/usr/local/bin/freescout-healthcheck).
+    #
+    # Waits directly on docker's healthcheck status rather than HTTP-polling
+    # /login: urllib follows redirects, and with APP_URL=https://... FreeScout
+    # will issue 3xx to the public host, whose name doesn't resolve in CI.
     suffix = secrets.token_hex(4)
     net = f"fs-net-{suffix}"
     pg = f"pg-{suffix}"
@@ -380,27 +385,30 @@ def stack_public_url():
             IMAGE,
         )
         port = _host_port(fs, "8080")
-        # Wait for the app to come up using the matching Host header — the
-        # loopback healthcheck is what we're actually testing.
-        end = time.time() + READY_DEADLINE_S
-        last_err = None
-        while time.time() < end:
-            try:
-                req = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/login",
-                    headers={"Host": app_url_host},
-                )
-                with urllib.request.urlopen(req, timeout=5) as r:
-                    if r.status == 200:
-                        break
-                    last_err = f"status={r.status}"
-            except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
-                last_err = repr(e)
-            time.sleep(2)
+
+        # Bootstrap takes ~60-90s before HEALTHCHECK's 120s start-period even
+        # begins counting; pad the deadline generously.
+        deadline = time.time() + READY_DEADLINE_S + HEALTHY_DEADLINE_S
+        last = None
+        while time.time() < deadline:
+            r = _sh("docker", "inspect", "--format",
+                    "{{json .State.Health}}", fs)
+            health = json.loads(r.stdout)
+            if not health:
+                pytest.skip("image has no HEALTHCHECK or daemon does not surface health")
+            last = health.get("Status")
+            if last == "healthy":
+                break
+            if last == "unhealthy":
+                print(_sh("docker", "logs", fs, check=False).stdout)
+                print(_sh("docker", "logs", fs, check=False).stderr)
+                print(json.dumps(health.get("Log", []), indent=2))
+                raise RuntimeError(f"container went unhealthy: {health.get('Log', [])[-1:]!r}")
+            time.sleep(3)
         else:
             print(_sh("docker", "logs", fs, check=False).stdout)
             print(_sh("docker", "logs", fs, check=False).stderr)
-            raise RuntimeError(f"/login did not return 200 within {READY_DEADLINE_S}s (last={last_err})")
+            raise RuntimeError(f"healthcheck still {last!r} after deadline")
 
         yield {"fs": fs, "pg": pg, "net": net, "port": port, "host": app_url_host}
     finally:
@@ -410,31 +418,17 @@ def stack_public_url():
 
 
 def test_healthcheck_healthy_with_public_app_url(stack_public_url):
-    # Sanity: without the spoofed Host header, FreeScout 403s us — proves the
-    # test is exercising the TrustHosts path and not getting a freebie.
+    # The fixture only yields once docker has reported the container `healthy`,
+    # so the positive assertion is already satisfied. Confirm the negative:
+    # an un-spoofed Host: 127.0.0.1 hits TrustHosts and gets 403 — proves the
+    # healthcheck genuinely traversed (and survived) that middleware.
     req = urllib.request.Request(f"http://127.0.0.1:{stack_public_url['port']}/login")
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             status = r.status
     except urllib.error.HTTPError as e:
         status = e.code
-    assert status == 403, f"expected 403 with Host: localhost, got {status}"
-
-    end = time.time() + HEALTHY_DEADLINE_S
-    last = None
-    while time.time() < end:
-        r = _sh("docker", "inspect", "--format", "{{json .State.Health}}",
-                stack_public_url["fs"])
-        health = json.loads(r.stdout)
-        if not health:
-            pytest.skip("image has no HEALTHCHECK or daemon does not surface health")
-        last = health.get("Status")
-        if last == "healthy":
-            return
-        if last == "unhealthy":
-            pytest.fail(f"container went unhealthy: {health.get('Log', [])[-1:]!r}")
-        time.sleep(3)
-    pytest.fail(f"healthcheck still {last!r} after {HEALTHY_DEADLINE_S}s")
+    assert status == 403, f"expected 403 from TrustHosts on un-spoofed Host, got {status}"
 
 
 def test_happy_path_mariadb(stack_mariadb):
