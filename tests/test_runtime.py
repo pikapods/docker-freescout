@@ -38,9 +38,15 @@ def _exec(container, *args, check=False):
 
 
 def _wait_pg_ready(container, deadline_s=30):
+    # Probe TCP, not the unix socket. The postgres image briefly serves
+    # the unix socket during init-script execution before restarting to
+    # enable TCP; without `-h 127.0.0.1` the wait can return too early
+    # and the first TCP client (psql or the freescout container) hits
+    # ECONNREFUSED.
     end = time.time() + deadline_s
     while time.time() < end:
-        if _exec(container, "pg_isready", "-U", "postgres").returncode == 0:
+        if _exec(container, "pg_isready",
+                 "-h", "127.0.0.1", "-U", "postgres").returncode == 0:
             return
         time.sleep(1)
     raise RuntimeError(f"postgres container {container} not ready within {deadline_s}s")
