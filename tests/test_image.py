@@ -121,6 +121,35 @@ class TestImageFilesystem:
             r = _run("test", "-f", path)
             assert r.returncode == 0, f"{path} missing"
 
+    def test_freescout_create_mailboxes_migration_present(self):
+        # The DB guard discovers the create_mailboxes migration filename at
+        # runtime via glob — if upstream renames or squashes it, the guard
+        # exits 2 and the container won't boot. Fail at image-build time
+        # instead so we catch drift before deploy.
+        r = _run(
+            "sh", "-c",
+            "ls /var/www/html/database/migrations/*_create_mailboxes_table.php "
+            "2>/dev/null | wc -l",
+        )
+        assert r.returncode == 0, r.stderr
+        count = int(r.stdout.strip())
+        assert count == 1, (
+            f"expected exactly one *_create_mailboxes_table.php migration, "
+            f"got {count}"
+        )
+
+    def test_db_guard_installed_executable(self):
+        path = "/usr/local/bin/freescout-db-guard"
+        r = _run("test", "-x", path)
+        assert r.returncode == 0, f"{path} missing or not executable"
+        r = _run(path)
+        # No-args invocation hits the usage branch and exits 2 with a
+        # usage line on stderr.
+        assert r.returncode == 2, f"expected exit 2 from no-args, got {r.returncode}"
+        assert "usage: freescout-db-guard" in r.stderr, (
+            f"usage line missing from stderr: {r.stderr!r}"
+        )
+
 
 # Marked runtime: a full image rebuild (~30s with buildkit cache, minutes
 # cold). Lives outside TestImageFilesystem so `-m 'not runtime'` keeps the

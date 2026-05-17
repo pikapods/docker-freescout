@@ -46,6 +46,23 @@ def _wait_pg_ready(container, deadline_s=30):
     raise RuntimeError(f"postgres container {container} not ready within {deadline_s}s")
 
 
+def _wait_mysql_ready(container, deadline_s=60):
+    # MariaDB init takes longer than postgres on first boot (datadir bootstrap
+    # + grant rebuild). Credentials are required because the root account is
+    # password-protected by the MARIADB_ROOT_PASSWORD env. MariaDB 11 dropped
+    # the mysql/mysqladmin symlinks — invoke the native names directly.
+    end = time.time() + deadline_s
+    while time.time() < end:
+        r = _exec(
+            container, "mariadb-admin", "ping",
+            "-h", "127.0.0.1", "-uroot", "-ptest", "--silent",
+        )
+        if r.returncode == 0:
+            return
+        time.sleep(1)
+    raise RuntimeError(f"mariadb container {container} not ready within {deadline_s}s")
+
+
 def _http_get(url, timeout=10):
     req = urllib.request.Request(url, headers={"Host": APP_HOST_HEADER})
     return urllib.request.urlopen(req, timeout=timeout)
@@ -102,7 +119,7 @@ def stack():
             "-e", "DB_PASS=test",
             "-e", "ADMIN_EMAIL=admin@smoke.local",
             "-e", "ADMIN_PASS=changeme",
-            "-p", "0:8080",
+            "-p", ":8080",
             IMAGE,
         )
         port = _host_port(fs, "8080")
@@ -116,6 +133,56 @@ def stack():
         yield {"fs": fs, "pg": pg, "net": net, "port": port}
     finally:
         for name in (fs, pg):
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        subprocess.run(["docker", "network", "rm", net], capture_output=True)
+
+
+@pytest.fixture(scope="session")
+def stack_mariadb():
+    """Mirror of `stack` against MariaDB. Proves the guard's
+    driver-agnostic claim end-to-end — Schema::getAllTables() and
+    Schema::hasTable() behave on MariaDB as well as Postgres."""
+    suffix = secrets.token_hex(4)
+    net = f"fs-net-{suffix}"
+    db = f"db-{suffix}"
+    fs = f"fs-{suffix}"
+    app_key = "base64:" + base64.b64encode(secrets.token_bytes(32)).decode()
+
+    _sh("docker", "network", "create", net)
+    try:
+        _sh(
+            "docker", "run", "-d", "--name", db, "--network", net,
+            "-e", "MARIADB_ROOT_PASSWORD=test",
+            "-e", "MARIADB_DATABASE=freescout",
+            "mariadb:11",
+        )
+        _wait_mysql_ready(db)
+
+        _sh(
+            "docker", "run", "-d", "--name", fs, "--network", net,
+            "-e", f"APP_KEY={app_key}",
+            "-e", "APP_URL=http://localhost:8080",
+            "-e", "DB_TYPE=mariadb",
+            "-e", f"DB_HOST={db}",
+            "-e", "DB_NAME=freescout",
+            "-e", "DB_USER=root",
+            "-e", "DB_PASS=test",
+            "-e", "ADMIN_EMAIL=admin@smoke.local",
+            "-e", "ADMIN_PASS=changeme",
+            "-p", ":8080",
+            IMAGE,
+        )
+        port = _host_port(fs, "8080")
+        try:
+            _wait_http_200(f"http://127.0.0.1:{port}/login", READY_DEADLINE_S)
+        except RuntimeError:
+            print(_sh("docker", "logs", fs, check=False).stdout)
+            print(_sh("docker", "logs", fs, check=False).stderr)
+            raise
+
+        yield {"fs": fs, "db": db, "net": net, "port": port}
+    finally:
+        for name in (fs, db):
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
         subprocess.run(["docker", "network", "rm", net], capture_output=True)
 
@@ -150,7 +217,7 @@ def stack_no_appkey():
             "-e", "ADMIN_EMAIL=admin@smoke.local",
             "-e", "ADMIN_PASS=changeme",
             "-v", f"{vol}:/data",
-            "-p", "0:8080",
+            "-p", ":8080",
             IMAGE,
         )
         port = _host_port(fs, "8080")
@@ -269,3 +336,239 @@ def test_healthcheck_reports_healthy(stack):
             pytest.fail(f"container went unhealthy: {health.get('Log', [])[-1:]!r}")
         time.sleep(3)
     pytest.fail(f"healthcheck still {last!r} after {HEALTHY_DEADLINE_S}s")
+
+
+def test_happy_path_mariadb(stack_mariadb):
+    # Healthcheck-style assertion: if `stack_mariadb` came up at all, the
+    # guard accepted an empty MariaDB and migrations ran to completion —
+    # which is the only end-to-end signal that Schema::getAllTables() /
+    # Schema::hasTable() work on MariaDB the same as on pgsql. Hit /login
+    # explicitly anyway to defend against the fixture's wait being subtly
+    # short.
+    with _http_get(f"http://127.0.0.1:{stack_mariadb['port']}/login") as r:
+        assert r.status == 200
+
+
+def _users_count(container):
+    # `freescout-db-guard users-count` is the same probe the bootstrap
+    # uses for the seed gate, so it directly exercises the production
+    # codepath. Stdout contract: exactly one integer.
+    r = _exec(container, "freescout-db-guard", "users-count", check=True)
+    return int(r.stdout.strip())
+
+
+def test_admin_not_reseeded_on_restart(stack_no_appkey):
+    # Test the invariant directly: the user count must not change across
+    # a restart. Asserting on a log line is unreliable here because
+    # stack_no_appkey is session-scoped and other tests already restart
+    # it — a stale 'skipping admin seed' from an earlier restart can
+    # false-pass even if this restart reseeded.
+    fs = stack_no_appkey["fs"]
+    before = _users_count(fs)
+    assert before == 1, (
+        f"expected exactly one seeded admin before restart, got {before}"
+    )
+    _sh("docker", "restart", fs)
+    port = _host_port(fs, "8080")
+    try:
+        _wait_http_200(f"http://127.0.0.1:{port}/login", READY_DEADLINE_S)
+    except RuntimeError:
+        print(_sh("docker", "logs", fs, check=False).stdout)
+        print(_sh("docker", "logs", fs, check=False).stderr)
+        raise
+    after = _users_count(fs)
+    assert after == before, (
+        f"users count changed across restart: {before} -> {after}; "
+        "admin appears to have been reseeded"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Wrong-DB preflight tests. Each spins up a fresh DB sidecar, pre-populates
+# it via `docker exec`, then runs the freescout container and waits for it
+# to exit. The guard's job is to abort the boot before migrations corrupt
+# someone else's database, so we assert on exit code + stderr content.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def bad_db_stack():
+    resources = {"networks": [], "containers": []}
+
+    def factory(driver, setup_sql):
+        suffix = secrets.token_hex(4)
+        net = f"fs-net-{suffix}"
+        db = f"db-{suffix}"
+        fs = f"fs-{suffix}"
+        resources["networks"].append(net)
+        resources["containers"].extend([db, fs])
+
+        _sh("docker", "network", "create", net)
+
+        if driver == "pgsql":
+            _sh(
+                "docker", "run", "-d", "--name", db, "--network", net,
+                "-e", "POSTGRES_PASSWORD=test",
+                "-e", "POSTGRES_DB=freescout",
+                "postgres:16",
+            )
+            _wait_pg_ready(db)
+            # Force TCP; psql defaults to a unix socket the postgres
+            # image doesn't bind in the locations psql probes.
+            r = _exec(db, "psql", "-h", "127.0.0.1", "-U", "postgres",
+                      "-d", "freescout", "-v", "ON_ERROR_STOP=1",
+                      "-c", setup_sql)
+            assert r.returncode == 0, (
+                f"pgsql setup failed: stdout={r.stdout!r} stderr={r.stderr!r}"
+            )
+            db_env = ["-e", "DB_TYPE=pgsql", "-e", "DB_USER=postgres"]
+        elif driver == "mariadb":
+            _sh(
+                "docker", "run", "-d", "--name", db, "--network", net,
+                "-e", "MARIADB_ROOT_PASSWORD=test",
+                "-e", "MARIADB_DATABASE=freescout",
+                "mariadb:11",
+            )
+            _wait_mysql_ready(db)
+            r = _exec(db, "mariadb", "-uroot", "-ptest", "freescout",
+                      "-e", setup_sql)
+            assert r.returncode == 0, (
+                f"mariadb setup failed: stdout={r.stdout!r} stderr={r.stderr!r}"
+            )
+            db_env = ["-e", "DB_TYPE=mariadb", "-e", "DB_USER=root"]
+        else:
+            raise ValueError(f"unknown driver {driver!r}")
+
+        app_key = "base64:" + base64.b64encode(secrets.token_bytes(32)).decode()
+        _sh(
+            "docker", "run", "-d", "--name", fs, "--network", net,
+            "--restart=no",
+            "-e", f"APP_KEY={app_key}",
+            "-e", "APP_URL=http://localhost:8080",
+            *db_env,
+            "-e", f"DB_HOST={db}",
+            "-e", "DB_NAME=freescout",
+            "-e", "DB_PASS=test",
+            IMAGE,
+        )
+        # docker wait blocks until the container exits and prints the
+        # exit code on stdout. Timeout guards against a buggy guard that
+        # hangs instead of aborting.
+        try:
+            w = subprocess.run(
+                ["docker", "wait", fs],
+                capture_output=True, text=True, timeout=180,
+            )
+        except subprocess.TimeoutExpired:
+            subprocess.run(["docker", "kill", fs], capture_output=True)
+            logs = _sh("docker", "logs", fs, check=False)
+            raise RuntimeError(
+                "freescout container did not exit within 180s; "
+                f"logs:\n{logs.stdout}\n{logs.stderr}"
+            )
+        exit_code = int(w.stdout.strip())
+        logs = _sh("docker", "logs", fs, check=False)
+        return exit_code, logs.stdout + logs.stderr
+
+    yield factory
+
+    for name in resources["containers"]:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    for net in resources["networks"]:
+        subprocess.run(["docker", "network", "rm", net], capture_output=True)
+
+
+# Discovered FreeScout migration filename — kept in sync at build time by
+# tests/test_image.py::test_freescout_create_mailboxes_migration_present.
+FS_CREATE_MAILBOXES_MIG = "2018_06_25_065719_create_mailboxes_table"
+
+
+def test_aborts_foreign_laravel_pgsql(bad_db_stack):
+    # A non-FreeScout Laravel app: migrations table exists, the create-
+    # mailboxes row is absent, and none of the FreeScout core tables are
+    # present.
+    sql = (
+        "CREATE TABLE migrations ("
+        "  id serial PRIMARY KEY,"
+        "  migration varchar(255) NOT NULL,"
+        "  batch int NOT NULL"
+        "); "
+        "INSERT INTO migrations (migration, batch) "
+        "VALUES ('2099_01_01_000000_some_other_app', 1);"
+    )
+    code, logs = bad_db_stack("pgsql", sql)
+    assert code != 0, f"guard should have aborted; logs:\n{logs}"
+    assert "missing FreeScout core tables" in logs, (
+        f"expected foreign-laravel diagnostic; logs:\n{logs}"
+    )
+
+
+def test_aborts_foreign_non_laravel_pgsql(bad_db_stack):
+    code, logs = bad_db_stack("pgsql", "CREATE TABLE my_app_table (id int);")
+    assert code != 0, f"guard should have aborted; logs:\n{logs}"
+    assert "no Laravel migrations table" in logs, (
+        f"expected foreign-non-laravel diagnostic; logs:\n{logs}"
+    )
+
+
+def test_aborts_foreign_non_laravel_mariadb(bad_db_stack):
+    code, logs = bad_db_stack("mariadb", "CREATE TABLE my_app_table (id int);")
+    assert code != 0, f"guard should have aborted; logs:\n{logs}"
+    assert "no Laravel migrations table" in logs, (
+        f"expected foreign-non-laravel diagnostic; logs:\n{logs}"
+    )
+
+
+def test_aborts_fake_mailboxes(bad_db_stack):
+    # A `mailboxes` table alone isn't proof of FreeScout — the guard
+    # demands the create_mailboxes_table migration row too. Without a
+    # migrations table at all, this lands in the "no Laravel migrations
+    # table" branch.
+    code, logs = bad_db_stack("pgsql", "CREATE TABLE mailboxes (id int);")
+    assert code != 0, f"guard should have aborted; logs:\n{logs}"
+    assert "no Laravel migrations table" in logs, (
+        f"expected non-laravel diagnostic for bare mailboxes; logs:\n{logs}"
+    )
+
+
+def test_aborts_partial_freescout(bad_db_stack):
+    # mailboxes + conversations + migrations row, but threads and
+    # customers are still missing — fingerprint must remain fail-closed.
+    sql = (
+        "CREATE TABLE migrations ("
+        "  id serial PRIMARY KEY,"
+        "  migration varchar(255) NOT NULL,"
+        "  batch int NOT NULL"
+        "); "
+        f"INSERT INTO migrations (migration, batch) "
+        f"VALUES ('{FS_CREATE_MAILBOXES_MIG}', 1); "
+        "CREATE TABLE mailboxes (id int); "
+        "CREATE TABLE conversations (id int);"
+    )
+    code, logs = bad_db_stack("pgsql", sql)
+    assert code != 0, f"guard should have aborted; logs:\n{logs}"
+    assert "missing FreeScout core tables: threads, customers" in logs, (
+        f"expected partial-freescout diagnostic naming threads+customers; "
+        f"logs:\n{logs}"
+    )
+
+
+def test_aborts_missing_fs_mig_row(bad_db_stack):
+    # All four FS tables exist but the migrations table is empty — the
+    # create_mailboxes_table row is what proves Laravel built this schema
+    # from the FreeScout codebase. Without it, refuse.
+    sql = (
+        "CREATE TABLE migrations ("
+        "  id serial PRIMARY KEY,"
+        "  migration varchar(255) NOT NULL,"
+        "  batch int NOT NULL"
+        "); "
+        "CREATE TABLE mailboxes (id int); "
+        "CREATE TABLE conversations (id int); "
+        "CREATE TABLE threads (id int); "
+        "CREATE TABLE customers (id int);"
+    )
+    code, logs = bad_db_stack("pgsql", sql)
+    assert code != 0, f"guard should have aborted; logs:\n{logs}"
+    assert "missing FreeScout create_mailboxes_table migration row" in logs, (
+        f"expected missing-mig-row diagnostic; logs:\n{logs}"
+    )

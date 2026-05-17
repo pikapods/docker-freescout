@@ -1,0 +1,134 @@
+#!/usr/bin/env php
+<?php
+// freescout-db-guard: gate the FreeScout bootstrap from accidentally
+// migrating against a non-FreeScout database. All Laravel-aware DB
+// logic lives here so the entrypoint shell stays driver-agnostic.
+//
+// Concurrency note: this guard assumes a single bootstrapper per DB.
+// Two containers racing first-boot against the same empty DB will
+// both pass preflight; Laravel's own migration lock handles the
+// subsequent migrate-time race, but the guard does not coordinate
+// across containers. Not a supported deployment for this image.
+
+if (PHP_SAPI !== 'cli') { fwrite(STDERR, "cli only\n"); exit(2); }
+
+$cmd = $argv[1] ?? '';
+if (! in_array($cmd, ['preflight', 'users-count'], true)) {
+    fwrite(STDERR, "usage: freescout-db-guard {preflight|users-count}\n");
+    exit(2);
+}
+
+try {
+    // Laravel bootstrap is inside try: missing .env, config parse errors,
+    // missing bootstrap/app.php all become structured exit 2 instead of
+    // unstructured PHP fatals.
+    chdir('/var/www/html');
+    require '/var/www/html/vendor/autoload.php';
+    $app = require '/var/www/html/bootstrap/app.php';
+    $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+
+    $schema = \DB::connection()->getSchemaBuilder();
+
+    if ($cmd === 'users-count') {
+        // Stdout contract: exactly one integer, nothing else.
+        // Explicit guard for a clearer diagnostic — the bootstrap only
+        // ever calls users-count post-migration, so a missing users
+        // table indicates a sequencing bug, not a normal state.
+        if (! $schema->hasTable('users')) {
+            fwrite(STDERR, "ERROR: users table is missing; users-count "
+                . "must run after migrations\n");
+            exit(2);
+        }
+        echo (int) \DB::table('users')->count() . "\n";
+        exit(0);
+    }
+
+    // ---- preflight ----
+    $fs_tables = ['mailboxes', 'conversations', 'threads', 'customers'];
+    $missing = array_values(array_filter(
+        $fs_tables, fn($t) => ! $schema->hasTable($t)
+    ));
+    $has_migrations = $schema->hasTable('migrations');
+
+    // Discover the FreeScout create-mailboxes migration filename from
+    // the on-disk migration source so the guard tracks upstream renames
+    // instead of hardcoding a literal string. The build-time
+    // test_freescout_create_mailboxes_migration_present catches drift
+    // before runtime if upstream ever renames or squashes it. Multiple
+    // matches are pathological (corrupted image) — abort loudly.
+    $glob = glob('/var/www/html/database/migrations/*_create_mailboxes_table.php');
+    if (! $glob) {
+        fwrite(STDERR, "ERROR: FreeScout create_mailboxes_table migration not "
+            . "found in image; upstream may have renamed it. The wrong-DB "
+            . "guard needs updating.\n");
+        exit(2);
+    }
+    if (count($glob) > 1) {
+        fwrite(STDERR, "ERROR: multiple create_mailboxes_table migration files "
+            . "found in image (corrupted layer?): " . implode(', ', $glob) . "\n");
+        exit(2);
+    }
+    $fs_mig_name = basename($glob[0], '.php');
+
+    $has_fs_mig = $has_migrations && \DB::table('migrations')
+        ->where('migration', $fs_mig_name)->exists();
+    $is_fs = empty($missing) && $has_fs_mig;
+    // Schema::getAllTables() is protected on Laravel 6 (FreeScout's
+    // version). Count via information_schema with driver-aware scoping:
+    // pgsql uses the 'public' namespace, mysql uses the current database.
+    $driver = \DB::connection()->getDriverName();
+    if ($driver === 'pgsql') {
+        $row = \DB::selectOne(
+            "SELECT count(*) AS c FROM information_schema.tables "
+            . "WHERE table_schema = 'public'"
+        );
+    } else {
+        $row = \DB::selectOne(
+            "SELECT count(*) AS c FROM information_schema.tables "
+            . "WHERE table_schema = database()"
+        );
+    }
+    $tables = (int) $row->c;
+
+    if ($is_fs) {
+        fwrite(STDERR, "[freescout-db-guard] DB has FreeScout schema; proceeding\n");
+        exit(0);
+    }
+    if (! $has_migrations && $tables === 0) {
+        fwrite(STDERR, "[freescout-db-guard] DB is empty; first-boot "
+            . "migrations will initialize it\n");
+        exit(0);
+    }
+
+    // Pull connection metadata from Laravel's resolved config — single
+    // source of truth with what Laravel will actually migrate against.
+    $conn = config('database.default');
+    $cfg  = config("database.connections.$conn");
+    $loc  = sprintf("'%s' at %s:%s", $cfg['database'], $cfg['host'], $cfg['port']);
+
+    if ($has_migrations) {
+        $why = $missing
+            ? "missing FreeScout core tables: " . implode(', ', $missing)
+            : "missing FreeScout create_mailboxes_table migration row";
+        fwrite(STDERR, <<<EOT
+ERROR: target database {$loc} contains a Laravel 'migrations' table
+       but is not a complete FreeScout database ({$why}). This image
+       requires a dedicated FreeScout database — refusing to migrate to
+       avoid corrupting another app's schema.
+
+EOT);
+    } else {
+        fwrite(STDERR, <<<EOT
+ERROR: target database {$loc} already contains {$tables} tables but
+       no Laravel migrations table. DB_NAME likely points to the wrong
+       database. This image requires a dedicated FreeScout database.
+
+EOT);
+    }
+    exit(1);
+
+} catch (\Throwable $e) {
+    fwrite(STDERR, "[freescout-db-guard] FATAL "
+        . get_class($e) . ": " . $e->getMessage() . "\n");
+    exit(2);
+}

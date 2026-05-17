@@ -128,6 +128,7 @@ COPY rootfs/ /
 #   with "Permission denied" opening nginx.conf.
 RUN chmod +x /etc/entrypoint.d/20-freescout-bootstrap.sh \
              /etc/s6-overlay/s6-rc.d/freescout-scheduler/run \
+             /usr/local/bin/freescout-db-guard \
     && chown -R www-data:www-data /etc/nginx \
     && docker-php-serversideup-s6-init
 

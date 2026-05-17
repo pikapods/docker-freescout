@@ -220,6 +220,22 @@ done
 log "DB is reachable"
 
 # ---------------------------------------------------------------------------
+# 6b. Preflight: refuse to migrate against a non-FreeScout database.
+#     Empty DB and an existing FreeScout DB both pass; anything else aborts.
+#     `rc=0` is reset *before* the call to avoid leaking a stale value from
+#     any prior shell context — `||` only fires on non-zero.
+# ---------------------------------------------------------------------------
+log "preflight: checking DB is empty or FreeScout-owned"
+rc=0
+( cd "$APP_DIR" && freescout-db-guard preflight ) || rc=$?
+case "$rc" in
+    0) ;;
+    1) exit 1 ;;   # guard already printed an actionable error
+    *) die "freescout-db-guard preflight crashed (exit $rc)" ;;
+esac
+unset rc
+
+# ---------------------------------------------------------------------------
 # 7. Install user modules. One alias at a time, no --force.
 # ---------------------------------------------------------------------------
 if [ -d /data/Modules ]; then
@@ -250,28 +266,14 @@ fi
 
 # ---------------------------------------------------------------------------
 # 9. Seed admin if first boot and ADMIN_EMAIL is set.
-#    Query the DB directly with the installed client — failures are fatal.
+#    users-count goes through the PHP guard so the bootstrap stays
+#    driver-agnostic — all Laravel-aware DB logic lives in one place.
 # ---------------------------------------------------------------------------
 if [ -n "${ADMIN_EMAIL:-}" ]; then
-    case "$DB_CONNECTION" in
-        pgsql)
-            user_count=$(PGPASSWORD="$DB_PASS" psql \
-                -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
-                -tA -c "SELECT COUNT(*) FROM users;") || \
-                die "could not query users table count (psql)"
-            ;;
-        mysql)
-            user_count=$(MYSQL_PWD="$DB_PASS" mysql \
-                -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -D "$DB_NAME" \
-                -N -B -e "SELECT COUNT(*) FROM users;") || \
-                die "could not query users table count (mysql)"
-            ;;
-    esac
-    user_count=$(printf '%s' "$user_count" | tr -d '[:space:]')
+    user_count=$(cd "$APP_DIR" && freescout-db-guard users-count) \
+        || die "freescout-db-guard users-count failed"
     case "$user_count" in
-        ''|*[!0-9]*)
-            die "unexpected users-count result: '$user_count'"
-            ;;
+        ''|*[!0-9]*) die "unexpected users-count output: '$user_count'" ;;
     esac
     if [ "$user_count" -eq 0 ]; then
         log "seeding admin user $ADMIN_EMAIL"
