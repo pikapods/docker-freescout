@@ -1,0 +1,9 @@
+#!/bin/sh
+# HEALTHCHECK probe. FreeScout's TrustHosts middleware 403s any request whose
+# Host header doesn't match APP_URL — see app/Http/Middleware/TrustHosts.php
+# upstream. Mirror APP_URL's host so loopback probes pass.
+set -eu
+url=${APP_URL:-${SITE_URL:-}}
+host=$(printf '%s' "$url" | sed -E 's#^[A-Za-z]+://##; s#/.*##; s#:[0-9]+$##')
+host=${host:-localhost}
+exec curl -fsS -H "Host: $host" http://127.0.0.1:8080/login -o /dev/null

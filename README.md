@@ -5,16 +5,13 @@ built on [`serversideup/php`](https://serversideup.net/open-source/docker-php/).
 
 This image powers FreeScout on [PikaPods](https://www.pikapods.com) and is
 maintained by the PikaPods team. It's published here for our users' reference
-and the benefit of the wider community. To run your own FreeScout pod from
-$2.3/month, see
-[pikapods.com/pods?run=freescout](https://www.pikapods.com/pods?run=freescout).
+and the benefit of the wider community. 
 
 Drop-in compatible with `tiredofit/docker-freescout` on env vars and volume
 layout (modulo the deliberate breaks called out below).
 
 Published to both `ghcr.io/pikapods/docker-freescout` and
-`pikapods/docker-freescout` (Docker Hub) — pick whichever registry you
-prefer. See [Tags](#tags) for the available tag scheme.
+`pikapods/docker-freescout` (Docker Hub).
 
 Source: https://github.com/pikapods/docker-freescout
 
@@ -26,13 +23,6 @@ Source: https://github.com/pikapods/docker-freescout
 | `<version>`         | mutable    | e.g. `1.8.219`. Latest revision of that FreeScout version (gets base-image security rebuilds in place). |
 | `<version>-r<n>`    | immutable  | e.g. `1.8.219-r2`. Exact build, never reused. Pin here for reproducible deploys. |
 
-## Why this image
-
-A small, maintainable FreeScout image focused on simplicity: a short
-entrypoint, validated artisan calls, idempotent boot, and a daily auto-rebuild
-against upstream FreeScout releases. Stays drop-in compatible with
-`tiredofit/docker-freescout` on env vars and volume layout so existing
-deployments can switch by changing only the image tag.
 
 ## Quick start
 
@@ -81,7 +71,9 @@ The compose file and `docker run` examples work as-is under
   Full decision matrix in [User & permissions](#user--permissions).
 - **Healthcheck inspection:** `podman healthcheck run <container>` runs
   the check on demand. Docker runs it automatically; inspect with
-  `docker inspect --format '{{.State.Health.Status}}' <container>`.
+  `docker inspect --format '{{.State.Health.Status}}' <container>`. The
+  probe spoofs `Host: <APP_URL host>` so FreeScout's `TrustHosts`
+  middleware doesn't 403 the loopback request — works under any `APP_URL`.
 
 ## Environment variables
 

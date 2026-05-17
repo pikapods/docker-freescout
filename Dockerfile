@@ -129,6 +129,7 @@ COPY rootfs/ /
 RUN chmod +x /etc/entrypoint.d/20-freescout-bootstrap.sh \
              /etc/s6-overlay/s6-rc.d/freescout-scheduler/run \
              /usr/local/bin/freescout-db-guard \
+             /usr/local/bin/freescout-healthcheck \
     && chown -R www-data:www-data /etc/nginx \
     && docker-php-serversideup-s6-init
 
@@ -144,10 +145,12 @@ ENV AUTORUN_ENABLED=false \
     APP_BASE_DIR=/var/www/html
 
 # Health endpoint hits /login (Laravel route, returns 200, exercises nginx + php-fpm).
+# Script wrapper spoofs the Host header to match APP_URL so FreeScout's TrustHosts
+# middleware doesn't 403 the loopback probe — see rootfs/.../freescout-healthcheck.
 # start-period bumped from 60s — first-boot after-app-update + storage:link + cold
 # opcache can take a while.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
-    CMD curl -fsS http://localhost:8080/login -o /dev/null || exit 1
+    CMD freescout-healthcheck || exit 1
 
 EXPOSE 8080
 

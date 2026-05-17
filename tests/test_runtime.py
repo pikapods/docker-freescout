@@ -344,6 +344,99 @@ def test_healthcheck_reports_healthy(stack):
     pytest.fail(f"healthcheck still {last!r} after {HEALTHY_DEADLINE_S}s")
 
 
+@pytest.fixture(scope="session")
+def stack_public_url():
+    # Mirrors `stack` but with a non-localhost APP_URL. Pins down that the
+    # healthcheck doesn't depend on operators setting APP_URL=http://localhost:...,
+    # since FreeScout's TrustHosts middleware would otherwise 403 the loopback
+    # probe (see rootfs/usr/local/bin/freescout-healthcheck).
+    suffix = secrets.token_hex(4)
+    net = f"fs-net-{suffix}"
+    pg = f"pg-{suffix}"
+    fs = f"fs-{suffix}"
+    app_url_host = "support.example.test"
+
+    _sh("docker", "network", "create", net)
+    try:
+        _sh(
+            "docker", "run", "-d", "--name", pg, "--network", net,
+            "-e", "POSTGRES_PASSWORD=test",
+            "-e", "POSTGRES_DB=freescout",
+            "postgres:16",
+        )
+        _wait_pg_ready(pg)
+
+        _sh(
+            "docker", "run", "-d", "--name", fs, "--network", net,
+            "-e", f"APP_URL=https://{app_url_host}",
+            "-e", "DB_TYPE=pgsql",
+            "-e", f"DB_HOST={pg}",
+            "-e", "DB_NAME=freescout",
+            "-e", "DB_USER=postgres",
+            "-e", "DB_PASS=test",
+            "-e", "ADMIN_EMAIL=admin@smoke.local",
+            "-e", "ADMIN_PASS=changeme",
+            "-p", ":8080",
+            IMAGE,
+        )
+        port = _host_port(fs, "8080")
+        # Wait for the app to come up using the matching Host header — the
+        # loopback healthcheck is what we're actually testing.
+        end = time.time() + READY_DEADLINE_S
+        last_err = None
+        while time.time() < end:
+            try:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/login",
+                    headers={"Host": app_url_host},
+                )
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    if r.status == 200:
+                        break
+                    last_err = f"status={r.status}"
+            except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+                last_err = repr(e)
+            time.sleep(2)
+        else:
+            print(_sh("docker", "logs", fs, check=False).stdout)
+            print(_sh("docker", "logs", fs, check=False).stderr)
+            raise RuntimeError(f"/login did not return 200 within {READY_DEADLINE_S}s (last={last_err})")
+
+        yield {"fs": fs, "pg": pg, "net": net, "port": port, "host": app_url_host}
+    finally:
+        for name in (fs, pg):
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        subprocess.run(["docker", "network", "rm", net], capture_output=True)
+
+
+def test_healthcheck_healthy_with_public_app_url(stack_public_url):
+    # Sanity: without the spoofed Host header, FreeScout 403s us — proves the
+    # test is exercising the TrustHosts path and not getting a freebie.
+    req = urllib.request.Request(f"http://127.0.0.1:{stack_public_url['port']}/login")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status = r.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 403, f"expected 403 with Host: localhost, got {status}"
+
+    end = time.time() + HEALTHY_DEADLINE_S
+    last = None
+    while time.time() < end:
+        r = _sh("docker", "inspect", "--format", "{{json .State.Health}}",
+                stack_public_url["fs"])
+        health = json.loads(r.stdout)
+        if not health:
+            pytest.skip("image has no HEALTHCHECK or daemon does not surface health")
+        last = health.get("Status")
+        if last == "healthy":
+            return
+        if last == "unhealthy":
+            pytest.fail(f"container went unhealthy: {health.get('Log', [])[-1:]!r}")
+        time.sleep(3)
+    pytest.fail(f"healthcheck still {last!r} after {HEALTHY_DEADLINE_S}s")
+
+
 def test_happy_path_mariadb(stack_mariadb):
     # Healthcheck-style assertion: if `stack_mariadb` came up at all, the
     # guard accepted an empty MariaDB and migrations ran to completion —
