@@ -78,12 +78,27 @@ RUN git clone --depth=1 --branch="${FREESCOUT_VERSION}" \
 # fails at optimized-autoload generation scanning
 # vendor/rap2hpoutre/laravel-log-viewer/src/controllers). Removing it first
 # gives Composer a clean slate.
+#
+# `composer require fzaninotto/faker` after the main --no-dev install:
+# FreeScout pins faker in require-dev, so --no-dev drops it. Vanilla
+# FreeScout never resolves Illuminate\Database\Eloquent\Factory, so the
+# gap is invisible — but third-party modules do. The Workflows module's
+# WorkflowsServiceProvider::boot() calls registerFactories() → app()
+# unconditionally, which constructs Faker\Factory and fatals with
+# "Class Faker\Factory not found". Pin matches FreeScout's require-dev so
+# the overrides/fzaninotto/faker autoload patches still line up.
 RUN cd /var/www/html \
     && rm -rf vendor \
     && composer install \
         --no-dev \
         --no-interaction \
         --no-progress \
+        --optimize-autoloader \
+        --ignore-platform-reqs \
+    && composer require fzaninotto/faker:v1.9.2 \
+        --no-interaction \
+        --no-progress \
+        --update-no-dev \
         --optimize-autoloader \
         --ignore-platform-reqs
 RUN cd /var/www/html && (php artisan freescout:build || true)
