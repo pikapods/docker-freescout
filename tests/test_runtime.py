@@ -280,6 +280,57 @@ def test_login_responds_200(stack):
     assert 'type="password"' in body or "password" in body.lower()
 
 
+@pytest.mark.parametrize("ext", ["log", "sql", "conf", "bak", "ini", "sh", "swp"])
+def test_attachment_url_reaches_laravel(stack, ext):
+    # serversideup/php-nginx's server-opts.d/security.conf denies any URL
+    # ending in these extensions outright. FreeScout legitimately serves
+    # user-uploaded attachments through Laravel
+    # (routes/open.php -> OpenController@downloadAttachment), so the
+    # extension regex must not pre-empt the route. With a bogus token the
+    # controller returns its own 403/404; the failure mode we guard
+    # against is nginx's stock 403 page, which means the request never
+    # reached PHP.
+    url = (
+        f"http://127.0.0.1:{stack['port']}/storage/attachment/"
+        f"0/0/0/x.{ext}?id=0&token=bogus"
+    )
+    req = urllib.request.Request(url, headers={"Host": APP_HOST_HEADER})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            body = r.read()
+    except urllib.error.HTTPError as e:
+        body = e.read()
+    # nginx's stock error page contains `<center>nginx</center>` in the
+    # footer. FreeScout's responses do not.
+    assert b"<center>nginx</center>" not in body, (
+        f".{ext} attachment URL was blocked by nginx instead of routed to "
+        f"Laravel; body={body[:200]!r}"
+    )
+
+
+def test_attachment_url_hidden_file_still_denied(stack):
+    # Boundary check on the override in
+    # rootfs/etc/nginx/server-opts.d/00-freescout-attachments.conf: it
+    # bypasses *only* the sensitive-extension deny. The sibling hidden-file
+    # deny (`location ~ /\.(?!well-known)`) must continue to fire for
+    # attachment paths whose filename starts with a dot.
+    url = (
+        f"http://127.0.0.1:{stack['port']}/storage/attachment/"
+        "0/0/0/.env?id=0&token=bogus"
+    )
+    req = urllib.request.Request(url, headers={"Host": APP_HOST_HEADER})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            status, body = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        status, body = e.code, e.read()
+    assert status == 403, f"expected nginx 403 on hidden-file attachment URL, got {status}"
+    assert b"<center>nginx</center>" in body, (
+        "expected nginx's stock 403 page (hidden-file deny still in effect); "
+        f"body={body[:200]!r}"
+    )
+
+
 def test_logs_clean(stack):
     logs = _sh("docker", "logs", stack["fs"], check=False)
     combined = logs.stdout + logs.stderr
