@@ -371,6 +371,19 @@ def test_bootstrap_populated_data(stack, path):
     assert r.returncode == 0, f"bootstrap did not produce {path}"
 
 
+@pytest.mark.parametrize("path", [
+    # The seed file itself in the volume...
+    "/data/storage/app/public/.gitignore",
+    # ...and as resolved through the public/storage symlink chain, which is
+    # exactly what FreeScout's System Status check reads. Both must be non-empty
+    # (-s) or the check prints the spurious "Create symlink manually" warning.
+    "/var/www/html/public/storage/.gitignore",
+])
+def test_public_storage_gitignore_seeded(stack, path):
+    r = _exec(stack["fs"], "test", "-s", path)
+    assert r.returncode == 0, f"missing/empty {path}; System Status would warn"
+
+
 def test_env_file_has_db_keys(stack):
     r = _exec(stack["fs"], "cat", "/data/config")
     assert r.returncode == 0, r.stderr

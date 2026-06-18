@@ -91,6 +91,18 @@ mkdir -p \
     /data/storage/logs \
     /data/storage/app/public
 
+# Seed storage/app/public/.gitignore. FreeScout's System Status check reads this
+# file *through* the public/storage symlink (public/storage/.gitignore ->
+# /data/storage/app/public/.gitignore) and demands non-empty content; a missing
+# file trips a spurious "Create symlink manually" warning even though the symlink
+# is valid. Upstream ships it in storage/app/public/ but the image rm -rf's that
+# tree before symlinking, so we replant it here. Idempotent: only write if absent
+# or empty (-s). Never clobber existing content.
+if [ ! -s /data/storage/app/public/.gitignore ]; then
+    log "seeding /data/storage/app/public/.gitignore"
+    printf '*\n!.gitignore\n' > /data/storage/app/public/.gitignore
+fi
+
 # ---------------------------------------------------------------------------
 # 3. Patch /data/config (the .env). User state — never rewritten wholesale.
 # ---------------------------------------------------------------------------
