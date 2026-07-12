@@ -88,6 +88,7 @@ The compose file and `docker run` examples work as-is under
 | `DB_NAME`             | yes      | DB name.                                                             |
 | `DB_USER`             | yes      | DB user.                                                             |
 | `DB_PASS`             | yes      | DB password.                                                         |
+| `DB_WAIT_TIMEOUT`     | no       | Seconds to wait for the DB at startup before giving up and stopping the container. `0` (default) waits forever and self-recovers when the DB appears; set a positive value only where a restart policy retries. |
 | `APP_KEY`             | no       | Laravel encryption key. Generated and persisted to `/data/config` on first boot. Pass `-e APP_KEY=…` only if you need to manage it externally (e.g. from a secret store); the image accepts whatever Laravel accepts. Once set, **do not change or remove it** — Laravel and FreeScout use it to decrypt sessions and encrypted columns; rotating it invalidates that data. |
 
 ### Admin seed (first boot only)

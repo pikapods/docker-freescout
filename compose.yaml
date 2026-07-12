@@ -19,6 +19,10 @@ services:
 
   freescout:
     image: ${FREESCOUT_IMAGE:-ghcr.io/pikapods/docker-freescout:latest}
+    # depends_on gates only the initial `up`; the image itself also waits for
+    # the DB in-place (DB_WAIT_TIMEOUT=0 default = wait forever, self-recover).
+    # Prefer fail-fast instead? Set DB_WAIT_TIMEOUT (e.g. "60") below — then
+    # `restart: unless-stopped` handles the retries.
     depends_on:
       postgres:
         condition: service_healthy

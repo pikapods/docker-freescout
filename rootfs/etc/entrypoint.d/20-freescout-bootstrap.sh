@@ -1,5 +1,6 @@
 #!/bin/sh
-# FreeScout bootstrap — runs once before s6 starts nginx + php-fpm.
+# FreeScout bootstrap — s6 init oneshot. nginx + php-fpm start in parallel
+# and serve 5xx until this completes; the scheduler longrun waits on it.
 # POSIX sh. Pipelines are avoided so artisan exit status is never masked.
 set -eu
 
@@ -64,6 +65,15 @@ case "$DB_TYPE_RAW" in
         ;;
 esac
 DB_PORT=${DB_PORT:-$DB_PORT_DEFAULT}
+
+# DB_WAIT_TIMEOUT: seconds to wait for the DB per wait episode (initial wait
+# and each mid-boot re-wait). 0 = wait forever (default) — self-recovering on
+# platforms where a stopped container is not restarted. >0 = fail fast; pair
+# with a restart policy that retries.
+DB_WAIT_TIMEOUT=${DB_WAIT_TIMEOUT:-0}
+case "$DB_WAIT_TIMEOUT" in
+    ''|*[!0-9]*) die "DB_WAIT_TIMEOUT must be a non-negative integer (got '$DB_WAIT_TIMEOUT')" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # 1b. Clean up the broken /data/storage/logs symlink left over from old
@@ -207,45 +217,78 @@ done
     log "WARN: php artisan storage:link returned non-zero"
 
 # ---------------------------------------------------------------------------
-# 6. Wait for DB. 30s deadline, fail fast on timeout.
+# 6. Wait for DB. Readiness = Laravel can run a query (freescout-db-guard
+#    ping), not just an open port — pg_isready/mysqladmin only gate the PHP
+#    boot cost and validate neither credentials nor database existence.
+#    DB_WAIT_TIMEOUT=0 (default) waits forever: the observed failure mode is
+#    platforms without a restart policy, where fail-fast means staying dead.
+#    An indefinitely-waiting oneshot is safe under s6: the only stage-2
+#    timeout is S6_CMD_WAIT_FOR_SERVICES_MAXTIME, which the base sets to 0.
 # ---------------------------------------------------------------------------
-log "waiting for $DB_CONNECTION at $DB_HOST:$DB_PORT (30s deadline)"
-deadline=$(( $(date +%s) + 30 ))
-while :; do
+port_open() {
     case "$DB_CONNECTION" in
-        pgsql)
-            if pg_isready -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" >/dev/null 2>&1; then
-                break
-            fi
-            ;;
-        mysql)
-            if mysqladmin ping -h "$DB_HOST" -P "$DB_PORT" --silent >/dev/null 2>&1; then
-                break
-            fi
-            ;;
+        pgsql) pg_isready -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" >/dev/null 2>&1 ;;
+        mysql) mysqladmin ping -h "$DB_HOST" -P "$DB_PORT" --silent >/dev/null 2>&1 ;;
     esac
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-        die "DB at $DB_HOST:$DB_PORT not reachable within 30s"
-    fi
-    sleep 1
-done
-log "DB is reachable"
+}
+
+wait_for_db() {
+    wait_start=$(date +%s)
+    next_log=0
+    while :; do
+        last_err="TCP endpoint $DB_HOST:$DB_PORT not accepting connections"
+        if port_open; then
+            ping_rc=0
+            ping_err=$( cd "$APP_DIR" && freescout-db-guard ping 2>&1 ) || ping_rc=$?
+            case "$ping_rc" in
+                0) log "DB ready (Laravel query succeeded)"; return 0 ;;
+                3) last_err=$ping_err ;;
+                4) last_err="$ping_err — server rejected the connection; check DB_USER/DB_PASS/DB_NAME if this persists" ;;
+                *) log "$ping_err"; die "freescout-db-guard ping crashed (exit $ping_rc)" ;;
+            esac
+        fi
+        now=$(date +%s)
+        elapsed=$(( now - wait_start ))
+        if [ "$DB_WAIT_TIMEOUT" -gt 0 ] && [ "$elapsed" -ge "$DB_WAIT_TIMEOUT" ]; then
+            die "DB not ready after ${elapsed}s (DB_WAIT_TIMEOUT=$DB_WAIT_TIMEOUT); last error: $last_err"
+        fi
+        if [ "$now" -ge "$next_log" ]; then
+            log "waiting for $DB_CONNECTION at $DB_HOST:$DB_PORT (${elapsed}s elapsed, timeout=${DB_WAIT_TIMEOUT}s): $last_err"
+            next_log=$(( now + 15 ))
+        fi
+        sleep 2
+    done
+}
+
+wait_for_db
 
 # ---------------------------------------------------------------------------
 # 6b. Preflight: refuse to migrate against a non-FreeScout database.
 #     Empty DB and an existing FreeScout DB both pass; anything else aborts.
-#     `rc=0` is reset *before* the call to avoid leaking a stale value from
-#     any prior shell context — `||` only fires on non-zero.
+#     Exit 3/4 = the DB dropped between wait and preflight — re-wait and
+#     retry, bounded so a flapping DB with DB_WAIT_TIMEOUT>0 still terminates.
+#     `pf_rc=0` is reset *before* the call to avoid leaking a stale value —
+#     `||` only fires on non-zero.
 # ---------------------------------------------------------------------------
 log "preflight: checking DB is empty or FreeScout-owned"
-rc=0
-( cd "$APP_DIR" && freescout-db-guard preflight ) || rc=$?
-case "$rc" in
-    0) ;;
-    1) exit 1 ;;   # guard already printed an actionable error
-    *) die "freescout-db-guard preflight crashed (exit $rc)" ;;
-esac
-unset rc
+pf_tries=0
+while :; do
+    pf_rc=0
+    ( cd "$APP_DIR" && freescout-db-guard preflight ) || pf_rc=$?
+    case "$pf_rc" in
+        0) break ;;
+        1) exit 1 ;;   # wrong-DB refusal; guard already printed an actionable error
+        3|4)
+            pf_tries=$(( pf_tries + 1 ))
+            [ "$pf_tries" -le 5 ] || die "DB kept dropping during preflight (5 attempts)"
+            log "DB connection lost during preflight (exit $pf_rc); re-waiting"
+            sleep 2
+            wait_for_db
+            ;;
+        *) die "freescout-db-guard preflight crashed (exit $pf_rc)" ;;
+    esac
+done
+unset pf_rc pf_tries
 
 # ---------------------------------------------------------------------------
 # 7. Install user modules. One alias at a time, no --force.
@@ -269,12 +312,27 @@ fi
 
 # ---------------------------------------------------------------------------
 # 8. freescout:after-app-update — runs migrations, clears cache, queue:restart,
-#    and module post-update hooks. Must succeed; non-zero is fatal.
+#    and module post-update hooks. Must succeed. Artisan's exit code cannot
+#    distinguish a connection drop from a migration bug, so on failure ask the
+#    guard: ping OK means the DB is fine and the failure was real (fatal);
+#    ping 3/4 means the DB dropped mid-run — re-wait and retry (the command is
+#    designed to be re-runnable every boot). Bounded at 3 runs.
 # ---------------------------------------------------------------------------
 log "running freescout:after-app-update"
-if ! ( cd "$APP_DIR" && php artisan freescout:after-app-update ) >&2; then
-    die "freescout:after-app-update failed (migrations did not complete)"
-fi
+aau_attempt=1
+while ! ( cd "$APP_DIR" && php artisan freescout:after-app-update ) >&2; do
+    aau_ping_rc=0
+    ( cd "$APP_DIR" && freescout-db-guard ping ) >/dev/null 2>&1 || aau_ping_rc=$?
+    case "$aau_ping_rc" in
+        3|4) ;;
+        *) die "freescout:after-app-update failed (migrations did not complete)" ;;
+    esac
+    aau_attempt=$(( aau_attempt + 1 ))
+    [ "$aau_attempt" -le 3 ] || die "freescout:after-app-update failed 3 times with the DB dropping mid-run"
+    log "DB connection lost during after-app-update; re-waiting (attempt $aau_attempt/3)"
+    wait_for_db
+done
+unset aau_attempt aau_ping_rc
 
 # ---------------------------------------------------------------------------
 # 9. Seed admin if first boot and ADMIN_EMAIL is set.
@@ -282,8 +340,25 @@ fi
 #    driver-agnostic — all Laravel-aware DB logic lives in one place.
 # ---------------------------------------------------------------------------
 if [ -n "${ADMIN_EMAIL:-}" ]; then
-    user_count=$(cd "$APP_DIR" && freescout-db-guard users-count) \
-        || die "freescout-db-guard users-count failed"
+    # Exit 3/4 = connection dropped after migrations — re-wait, retry once.
+    # create-user failure below stays fatal (tiny window, artisan's exit code
+    # is unclassifiable).
+    uc_tries=0
+    while :; do
+        uc_rc=0
+        user_count=$(cd "$APP_DIR" && freescout-db-guard users-count) || uc_rc=$?
+        case "$uc_rc" in
+            0) break ;;
+            3|4)
+                uc_tries=$(( uc_tries + 1 ))
+                [ "$uc_tries" -le 1 ] || die "freescout-db-guard users-count failed (DB dropped twice)"
+                log "DB connection lost during users-count (exit $uc_rc); re-waiting"
+                wait_for_db
+                ;;
+            *) die "freescout-db-guard users-count failed (exit $uc_rc)" ;;
+        esac
+    done
+    unset uc_rc uc_tries
     case "$user_count" in
         ''|*[!0-9]*) die "unexpected users-count output: '$user_count'" ;;
     esac

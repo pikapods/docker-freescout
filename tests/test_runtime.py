@@ -729,3 +729,189 @@ def test_aborts_missing_fs_mig_row(bad_db_stack):
     assert "missing FreeScout create_mailboxes_table migration row" in logs, (
         f"expected missing-mig-row diagnostic; logs:\n{logs}"
     )
+
+
+# ---------------------------------------------------------------------------
+# DB-availability resilience tests. With the default DB_WAIT_TIMEOUT=0 the
+# bootstrap waits in place for the DB — a late or flapping Postgres must
+# never require a container restart to recover (the incident this guards
+# against). DB_WAIT_TIMEOUT>0 opts back into fail-fast. All containers run
+# with --restart=no so any "recovery" observed is in-place, not a restart.
+# ---------------------------------------------------------------------------
+
+# > the old hardcoded 30s deadline; surviving this long proves the wait is
+# no longer bounded by it.
+BEYOND_OLD_DEADLINE_S = 45
+
+
+def _run_freescout(net, name, db_host, *extra_env, db_pass="test"):
+    app_key = "base64:" + base64.b64encode(secrets.token_bytes(32)).decode()
+    _sh(
+        "docker", "run", "-d", "--name", name, "--network", net,
+        "--restart=no",
+        "-e", f"APP_KEY={app_key}",
+        "-e", "APP_URL=http://localhost:8080",
+        "-e", "DB_TYPE=pgsql",
+        "-e", f"DB_HOST={db_host}",
+        "-e", "DB_NAME=freescout",
+        "-e", "DB_USER=postgres",
+        "-e", f"DB_PASS={db_pass}",
+        "-p", ":8080",
+        *extra_env,
+        IMAGE,
+    )
+
+
+def _is_running(container):
+    r = _sh("docker", "inspect", "--format", "{{.State.Running}}", container)
+    return r.stdout.strip() == "true"
+
+
+def _logs(container):
+    r = _sh("docker", "logs", container, check=False)
+    return r.stdout + r.stderr
+
+
+@pytest.fixture
+def db_wait_resources():
+    resources = {"networks": [], "containers": []}
+    yield resources
+    for name in resources["containers"]:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    for net in resources["networks"]:
+        subprocess.run(["docker", "network", "rm", net], capture_output=True)
+
+
+def test_late_db_start_recovers_without_restart(db_wait_resources):
+    # Postgres does not exist yet when freescout boots — DB_HOST doesn't even
+    # resolve. The container must wait in place and come up on its own once
+    # the DB appears.
+    suffix = secrets.token_hex(4)
+    net, pg, fs = f"fs-net-{suffix}", f"pg-{suffix}", f"fs-{suffix}"
+    db_wait_resources["networks"].append(net)
+    db_wait_resources["containers"].extend([pg, fs])
+
+    _sh("docker", "network", "create", net)
+    _run_freescout(
+        net, fs, pg,
+        "-e", "ADMIN_EMAIL=admin@smoke.local",
+        "-e", "ADMIN_PASS=changeme",
+    )
+    time.sleep(BEYOND_OLD_DEADLINE_S)
+    assert _is_running(fs), (
+        f"container died while DB was absent; logs:\n{_logs(fs)}"
+    )
+    assert "waiting for pgsql" in _logs(fs), (
+        f"expected wait-loop progress logging; logs:\n{_logs(fs)}"
+    )
+
+    _sh(
+        "docker", "run", "-d", "--name", pg, "--network", net,
+        "-e", "POSTGRES_PASSWORD=test",
+        "-e", "POSTGRES_DB=freescout",
+        "postgres:16",
+    )
+    port = _host_port(fs, "8080")
+    try:
+        _wait_http_200(f"http://127.0.0.1:{port}/login", READY_DEADLINE_S)
+    except RuntimeError:
+        print(_logs(fs))
+        raise
+    r = _sh("docker", "inspect", "--format", "{{.RestartCount}}", fs)
+    assert r.stdout.strip() == "0", "recovery must not depend on a restart"
+
+
+def test_db_down_at_boot_recovers_when_db_returns(db_wait_resources):
+    # Flap variant: a previously-initialized freescout re-boots while its DB
+    # is down (the exact PikaPods incident shape). It must wait, then finish
+    # the boot once the DB is back.
+    suffix = secrets.token_hex(4)
+    net, pg, fs = f"fs-net-{suffix}", f"pg-{suffix}", f"fs-{suffix}"
+    db_wait_resources["networks"].append(net)
+    db_wait_resources["containers"].extend([pg, fs])
+
+    _sh("docker", "network", "create", net)
+    _sh(
+        "docker", "run", "-d", "--name", pg, "--network", net,
+        "-e", "POSTGRES_PASSWORD=test",
+        "-e", "POSTGRES_DB=freescout",
+        "postgres:16",
+    )
+    _wait_pg_ready(pg)
+    _run_freescout(net, fs, pg)
+    port = _host_port(fs, "8080")
+    try:
+        _wait_http_200(f"http://127.0.0.1:{port}/login", READY_DEADLINE_S)
+    except RuntimeError:
+        print(_logs(fs))
+        raise
+
+    _sh("docker", "stop", pg)
+    _sh("docker", "restart", fs)
+    time.sleep(BEYOND_OLD_DEADLINE_S)
+    assert _is_running(fs), (
+        f"re-boot with DB down must wait, not die; logs:\n{_logs(fs)}"
+    )
+
+    _sh("docker", "start", pg)
+    port = _host_port(fs, "8080")  # ephemeral port may change on restart
+    try:
+        _wait_http_200(f"http://127.0.0.1:{port}/login", READY_DEADLINE_S)
+    except RuntimeError:
+        print(_logs(fs))
+        raise
+
+
+def test_db_wait_timeout_fails_fast(db_wait_resources):
+    # Opt-in fail-fast: with DB_WAIT_TIMEOUT>0 and no DB, the container must
+    # exit non-zero (S6_BEHAVIOUR_IF_STAGE2_FAILS=2 halts on oneshot failure)
+    # so a restart policy can take over.
+    suffix = secrets.token_hex(4)
+    net, fs = f"fs-net-{suffix}", f"fs-{suffix}"
+    db_wait_resources["networks"].append(net)
+    db_wait_resources["containers"].append(fs)
+
+    _sh("docker", "network", "create", net)
+    _run_freescout(net, fs, "no-such-db-host", "-e", "DB_WAIT_TIMEOUT=15")
+    try:
+        w = subprocess.run(
+            ["docker", "wait", fs],
+            capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        subprocess.run(["docker", "kill", fs], capture_output=True)
+        raise RuntimeError(
+            f"container did not fail fast with DB_WAIT_TIMEOUT=15; logs:\n{_logs(fs)}"
+        )
+    assert int(w.stdout.strip()) != 0, f"expected non-zero exit; logs:\n{_logs(fs)}"
+    assert "DB not ready after" in _logs(fs), (
+        f"expected timeout diagnostic with last error; logs:\n{_logs(fs)}"
+    )
+
+
+def test_wrong_password_waits_with_credential_hint(db_wait_resources):
+    # Credential rejection is retryable by design (a not-yet-provisioned role
+    # is indistinguishable from a typo'd password), but the logs must carry
+    # an unambiguous hint instead of a generic connection error.
+    suffix = secrets.token_hex(4)
+    net, pg, fs = f"fs-net-{suffix}", f"pg-{suffix}", f"fs-{suffix}"
+    db_wait_resources["networks"].append(net)
+    db_wait_resources["containers"].extend([pg, fs])
+
+    _sh("docker", "network", "create", net)
+    _sh(
+        "docker", "run", "-d", "--name", pg, "--network", net,
+        "-e", "POSTGRES_PASSWORD=test",
+        "-e", "POSTGRES_DB=freescout",
+        "postgres:16",
+    )
+    _wait_pg_ready(pg)
+    _run_freescout(net, fs, pg, db_pass="wrong")
+    time.sleep(BEYOND_OLD_DEADLINE_S)
+    assert _is_running(fs), (
+        f"wrong credentials must keep retrying, not kill the container; "
+        f"logs:\n{_logs(fs)}"
+    )
+    assert "check DB_USER/DB_PASS/DB_NAME" in _logs(fs), (
+        f"expected credential hint in wait-loop logs; logs:\n{_logs(fs)}"
+    )

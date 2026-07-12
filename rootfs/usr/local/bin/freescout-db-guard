@@ -13,9 +13,89 @@
 if (PHP_SAPI !== 'cli') { fwrite(STDERR, "cli only\n"); exit(2); }
 
 $cmd = $argv[1] ?? '';
-if (! in_array($cmd, ['preflight', 'users-count'], true)) {
-    fwrite(STDERR, "usage: freescout-db-guard {preflight|users-count}\n");
+if (! in_array($cmd, ['preflight', 'users-count', 'ping'], true)) {
+    fwrite(STDERR, "usage: freescout-db-guard {preflight|users-count|ping}\n");
     exit(2);
+}
+
+// Exit-code contract (all subcommands):
+//   0 = success
+//   1 = wrong-database refusal (preflight only; actionable message printed)
+//   2 = genuine crash/bug (broken .env, guard bug, missing users table, ...)
+//   3 = DB unreachable / connection lost — retryable, bootstrap re-waits
+//   4 = server reachable but rejected credentials/role/database — retryable
+//       (a not-yet-provisioned role is indistinguishable from a typo'd
+//       password), but the bootstrap logs a credential hint alongside it.
+function classify_db_exception(Throwable $e): int
+{
+    // Rejection by a live server: fix is credentials/provisioning, not time.
+    // Checked before the connection patterns because pgsql prefixes these
+    // with SQLSTATE[08006], which would otherwise match as exit 3.
+    $auth_patterns = [
+        'password authentication failed',
+        'no pg_hba.conf entry for host',
+        'access denied for user',
+        'unknown database',
+    ];
+    // Network/availability failures: time (or the DB coming up) fixes them.
+    $conn_patterns = [
+        'sqlstate[08',
+        'connection refused',
+        'connection timed out',
+        'no route to host',
+        'php_network_getaddresses',   // DNS not resolvable (compose: service not created yet)
+        'could not connect to server',
+        'the database system is starting up',
+        'the database system is in recovery mode',
+        'the database system is shutting down',
+        'server closed the connection unexpectedly',
+        'mysql server has gone away',
+        'lost connection to mysql server',
+    ];
+
+    for ($ex = $e; $ex !== null; $ex = $ex->getPrevious()) {
+        if (! $ex instanceof PDOException) {
+            continue;
+        }
+        $msg = strtolower($ex->getMessage());
+        foreach ($auth_patterns as $p) {
+            if (str_contains($msg, $p)) {
+                return 4;
+            }
+        }
+        // pgsql: FATAL: role "x" does not exist / database "x" does not exist
+        if (str_contains($msg, 'does not exist')
+            && (str_contains($msg, 'role "') || str_contains($msg, 'database "'))) {
+            return 4;
+        }
+        foreach ($conn_patterns as $p) {
+            if (str_contains($msg, $p)) {
+                return 3;
+            }
+        }
+    }
+
+    // Backstop: Laravel's own lost-connection heuristics. trait_exists guards
+    // against classification running when the autoloader itself failed.
+    // NB: FreeScout overrides this trait (overrides/laravel/framework/...)
+    // with the pre-6.x signature `causedByLostConnection(Exception $e)` —
+    // hence Exception, not Throwable, here and at the call site.
+    if (trait_exists(Illuminate\Database\DetectsLostConnections::class)) {
+        $detector = new class {
+            use Illuminate\Database\DetectsLostConnections;
+            public function lost(Exception $e): bool
+            {
+                return $this->causedByLostConnection($e);
+            }
+        };
+        for ($ex = $e; $ex !== null; $ex = $ex->getPrevious()) {
+            if ($ex instanceof Exception && $detector->lost($ex)) {
+                return 3;
+            }
+        }
+    }
+
+    return 2;
 }
 
 try {
@@ -26,6 +106,14 @@ try {
     require '/var/www/html/vendor/autoload.php';
     $app = require '/var/www/html/bootstrap/app.php';
     $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+
+    if ($cmd === 'ping') {
+        // Readiness probe: proves Laravel can actually run a query —
+        // credentials, database existence, and acceptance state included —
+        // which pg_isready/mysqladmin (TCP-level) cannot.
+        \DB::connection()->select('select 1');
+        exit(0);
+    }
 
     $schema = \DB::connection()->getSchemaBuilder();
 
@@ -128,7 +216,13 @@ EOT);
     exit(1);
 
 } catch (\Throwable $e) {
-    fwrite(STDERR, "[freescout-db-guard] FATAL "
-        . get_class($e) . ": " . $e->getMessage() . "\n");
-    exit(2);
+    $code = classify_db_exception($e);
+    if ($code === 2) {
+        fwrite(STDERR, "[freescout-db-guard] FATAL "
+            . get_class($e) . ": " . $e->getMessage() . "\n");
+    } else {
+        fwrite(STDERR, "[freescout-db-guard] DB unavailable ("
+            . get_class($e) . "): " . $e->getMessage() . "\n");
+    }
+    exit($code);
 }
