@@ -495,6 +495,29 @@ def test_healthcheck_healthy_with_public_app_url(stack_public_url):
     assert status == 403, f"expected 403 from TrustHosts on un-spoofed Host, got {status}"
 
 
+def test_healthcheck_healthy_with_db_down(stack_public_url):
+    # Liveness semantics: the probe must NOT report unhealthy while the DB is
+    # unreachable — restarting FreeScout can't fix its database. With an https
+    # APP_URL the scheme redirect fires before anything touches the DB, so
+    # /login answers 302 even mid-outage; with an http APP_URL it would be a
+    # Laravel 500 — the script classifies both healthy. Also pins that the
+    # probe emits a diagnostic line; the previous curl-only probe left empty
+    # health-log entries when it failed, which was undebuggable in production.
+    pg = stack_public_url["pg"]
+    _sh("docker", "stop", pg)
+    try:
+        r = _exec(stack_public_url["fs"], "freescout-healthcheck")
+        assert r.returncode == 0, (
+            f"probe unhealthy with DB down: {r.stdout!r} {r.stderr!r}"
+        )
+        assert r.stdout.startswith("healthy: HTTP "), (
+            f"expected 'healthy: HTTP <code>' diagnostic line, got {r.stdout!r}"
+        )
+    finally:
+        _sh("docker", "start", pg)
+        _wait_pg_ready(pg)
+
+
 def test_happy_path_mariadb(stack_mariadb):
     # Healthcheck-style assertion: if `stack_mariadb` came up at all, the
     # guard accepted an empty MariaDB and migrations ran to completion —

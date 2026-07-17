@@ -1,9 +1,45 @@
 #!/bin/sh
-# HEALTHCHECK probe. FreeScout's TrustHosts middleware 403s any request whose
-# Host header doesn't match APP_URL — see app/Http/Middleware/TrustHosts.php
-# upstream. Mirror APP_URL's host so loopback probes pass.
+# HEALTHCHECK probe with liveness semantics: a restart only helps when nginx or
+# php-fpm are wedged, so only transport failures (connect refused, timeout) and
+# gateway errors (502/503/504) count as unhealthy. App-level responses — 500
+# from e.g. a DB outage included — count as healthy: PHP executed and answered,
+# restarting this container can't fix what's wrong.
+#
+# FreeScout's TrustHosts middleware 403s any request whose Host header doesn't
+# match APP_URL — see app/Http/Middleware/TrustHosts.php upstream. Mirror
+# APP_URL's host so loopback probes pass (a 403 would count healthy under the
+# rules above, but "healthy: HTTP 200" in the log beats a permanent 403).
+#
+# Known trade-offs:
+# - `artisan down` (maintenance mode) answers 503 and reads as unhealthy.
+#   Acceptable: this image never enters maintenance mode on its own.
+# - A hanging (not refused) DB still fails the probe: /login blocks on the PDO
+#   connect past --max-time. Full decoupling would need a non-Laravel endpoint
+#   and lose the "app actually boots" signal.
 set -eu
 url=${APP_URL:-${SITE_URL:-}}
 host=$(printf '%s' "$url" | sed -E 's#^[A-Za-z]+://##; s#/.*##; s#:[0-9]+$##')
 host=${host:-localhost}
-exec curl -fsS -H "Host: $host" http://127.0.0.1:8080/login -o /dev/null
+
+# --max-time stays below HEALTHCHECK --timeout: a slow request makes curl exit
+# 28 with a message we can log, instead of the runtime SIGKILLing the probe —
+# which leaves an empty, undebuggable entry in the health log.
+rc=0
+out=$(curl -sS -o /dev/null -w '%{http_code} %{time_total}s' --max-time 8 \
+      -H "Host: $host" http://127.0.0.1:8080/login 2>&1) || rc=$?
+
+if [ "$rc" -ne 0 ]; then
+    echo "unhealthy: curl rc=$rc: $out"
+    exit 1
+fi
+code=${out%% *}
+case $code in
+    502|503|504)
+        echo "unhealthy: HTTP $code from nginx — php-fpm not serving (${out#* })"
+        exit 1
+        ;;
+    *)
+        echo "healthy: HTTP $code (${out#* })"
+        exit 0
+        ;;
+esac

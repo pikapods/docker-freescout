@@ -160,12 +160,18 @@ ENV AUTORUN_ENABLED=false \
     ENABLE_FREESCOUT_SCHEDULER=TRUE \
     APP_BASE_DIR=/var/www/html
 
-# Health endpoint hits /login (Laravel route, returns 200, exercises nginx + php-fpm).
-# Script wrapper spoofs the Host header to match APP_URL so FreeScout's TrustHosts
-# middleware doesn't 403 the loopback probe — see rootfs/.../freescout-healthcheck.
+# Health probe hits /login (full nginx + php-fpm + Laravel path) with liveness
+# semantics: only transport failures and 502/503/504 mark the container
+# unhealthy — app-level errors (e.g. 500 while the DB is down) don't, since a
+# restart can't fix those. The script spoofs the Host header to match APP_URL
+# (TrustHosts 403s loopback otherwise) and self-limits curl below --timeout so
+# failures log a reason instead of being SIGKILLed with an empty health-log
+# entry — see rootfs/.../freescout-healthcheck.
+# retries=5: remaining failure causes are fpm saturated or dead; ~2.5min of
+# tolerance avoids restart churn on transient load spikes.
 # start-period bumped from 60s — first-boot after-app-update + storage:link + cold
 # opcache can take a while.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=5 \
     CMD freescout-healthcheck || exit 1
 
 EXPOSE 8080
