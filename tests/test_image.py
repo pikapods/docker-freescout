@@ -106,6 +106,22 @@ class TestImageFilesystem:
         )
         assert r.returncode == 0, "scheduler dependency marker on bootstrap missing"
 
+    @pytest.mark.parametrize("service,dep", [
+        ("nginx", "10-init-webserver-config"),
+        ("php-fpm", "5-fpm-pool-user"),
+    ])
+    def test_s6_service_ordered_after_config_oneshot(self, service, dep):
+        # The base image starts nginx in parallel with the oneshot that
+        # renders nginx.conf and creates the conf.d/default.conf symlink
+        # (created last). A fresh container losing that race loads a valid
+        # but server-less config, binds nothing, and wedges until recreated.
+        # The Dockerfile appends these deps after docker-php-serversideup-s6-init.
+        r = _run("cat", f"/etc/s6-overlay/s6-rc.d/{service}/dependencies")
+        assert r.returncode == 0, f"{service} dependencies file missing: {r.stderr}"
+        assert dep in r.stdout.split(), (
+            f"{service} must depend on {dep}; got {r.stdout!r}"
+        )
+
     def test_s6_bootstrap_oneshot_installed(self):
         # The base image's docker-php-serversideup-s6-init moves our
         # /etc/entrypoint.d/20-freescout-bootstrap.sh into /etc/s6-overlay/scripts/
