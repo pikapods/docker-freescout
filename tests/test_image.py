@@ -132,6 +132,28 @@ class TestImageFilesystem:
             f"(stdout={r.stdout!r}, stderr={r.stderr!r})"
         )
 
+    def test_boot_gate_sentinel_shipped_raised(self):
+        # The boot gate must be closed from the very first request of a
+        # fresh container: the sentinel ships in the image and the bootstrap
+        # removes it as its final step.
+        r = _run("test", "-f", "/var/www/html/.freescout-bootstrap-incomplete")
+        assert r.returncode == 0, "boot-gate sentinel missing from image"
+
+    def test_boot_gate_nginx_conf_matches_sentinel(self):
+        r = _run("cat", "/etc/nginx/server-opts.d/00-freescout-bootstrap-gate.conf")
+        assert r.returncode == 0, "boot-gate nginx conf missing"
+        assert "/var/www/html/.freescout-bootstrap-incomplete" in r.stdout, (
+            "gate conf does not reference the sentinel path"
+        )
+        assert "return 500" in r.stdout, (
+            "gate must answer 500 — 503 would trip the liveness healthcheck"
+        )
+        assert "$uri = /healthcheck" in r.stdout, (
+            "gate must exempt php-fpm's /healthcheck ping path, or the s6 "
+            "nginx readiness check never succeeds and the container cannot "
+            "halt on bootstrap failure"
+        )
+
     def test_freescout_app_present(self):
         for path in ("/var/www/html/artisan", "/var/www/html/composer.json"):
             r = _run("test", "-f", path)

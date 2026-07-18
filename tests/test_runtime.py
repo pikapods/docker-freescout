@@ -13,7 +13,10 @@ import pytest
 pytestmark = pytest.mark.runtime
 
 IMAGE = os.environ["IMAGE"]
-READY_DEADLINE_S = 180
+# The boot gate answers 500 until the bootstrap oneshot (DB wait + full
+# migrations + module install) finishes, so waiting for a 200 now means
+# waiting for the complete first boot — size the deadline for slow CI runners.
+READY_DEADLINE_S = 300
 HEALTHY_DEADLINE_S = 90
 
 # FreeScout/Laravel rejects requests whose Host header does not match APP_URL
@@ -560,6 +563,261 @@ def test_admin_not_reseeded_on_restart(stack_no_appkey):
     assert after == before, (
         f"users count changed across restart: {before} -> {after}; "
         "admin appears to have been reseeded"
+    )
+
+
+@pytest.fixture
+def module_stack():
+    """Stack whose /data volume is pre-seeded with a minimal module BEFORE
+    the first boot, mirroring a deployment with web-installed modules on a
+    persistent volume. Function-scoped: the fake module must not leak into
+    the shared session stacks."""
+    suffix = secrets.token_hex(4)
+    net = f"fs-net-{suffix}"
+    pg = f"pg-{suffix}"
+    fs = f"fs-{suffix}"
+    vol = f"fs-data-{suffix}"
+    app_key = "base64:" + base64.b64encode(secrets.token_bytes(32)).decode()
+    containers = []
+
+    def start_fs(name):
+        containers.append(name)
+        _sh(
+            "docker", "run", "-d", "--name", name, "--network", net,
+            "-e", f"APP_KEY={app_key}",
+            "-e", "APP_URL=http://localhost:8080",
+            "-e", "DB_TYPE=pgsql",
+            "-e", f"DB_HOST={pg}",
+            "-e", "DB_NAME=freescout",
+            "-e", "DB_USER=postgres",
+            "-e", "DB_PASS=test",
+            "-e", "ADMIN_EMAIL=admin@smoke.local",
+            "-e", "ADMIN_PASS=changeme",
+            "-v", f"{vol}:/data",
+            "-p", ":8080",
+            IMAGE,
+        )
+
+    _sh("docker", "network", "create", net)
+    _sh("docker", "volume", "create", vol)
+    try:
+        # Seed the module through the image itself so /data stays owned by
+        # www-data. module.json carries the keys the module scanner reads;
+        # Public/ holds the asset the public symlink must expose. Compact
+        # single-line JSON on purpose: it is valid, occurs in the wild, and
+        # defeats line-oriented alias extraction — the bootstrap must parse
+        # it correctly (json_decode, not awk).
+        module_json = json.dumps(
+            {
+                "name": "TestMod", "alias": "testmod", "description": "",
+                "keywords": [], "active": 0, "order": 0, "providers": [],
+                "aliases": {}, "files": [], "requires": [],
+            },
+        )
+        # A real migration in the module: nwidart's module:migrate is a
+        # silent no-op in this image (it strips base_path() off a path that
+        # resolves into /data, so Laravel globs an empty directory and exits
+        # 0) — the bootstrap must run module migrations via `migrate
+        # --path`, and this probe table is how the tests notice if that
+        # regresses back to the no-op. No single quotes in the PHP: the
+        # whole file rides inside a single-quoted sh word.
+        probe_migration = (
+            "<?php\n"
+            "use Illuminate\\Database\\Migrations\\Migration;\n"
+            "use Illuminate\\Database\\Schema\\Blueprint;\n"
+            "use Illuminate\\Support\\Facades\\Schema;\n"
+            "class CreateTestmodProbeTable extends Migration {\n"
+            "    public function up() { Schema::create(\"testmod_probe\","
+            " function (Blueprint $table) { $table->increments(\"id\"); }); }\n"
+            "    public function down() { Schema::dropIfExists(\"testmod_probe\"); }\n"
+            "}\n"
+        )
+        _sh(
+            "docker", "run", "--rm", "--entrypoint", "sh",
+            "-v", f"{vol}:/data", IMAGE, "-c",
+            "mkdir -p /data/Modules/TestMod/Public/css"
+            " /data/Modules/TestMod/Database/Migrations && "
+            f"printf '%s\\n' '{module_json}'"
+            " > /data/Modules/TestMod/module.json && "
+            f"printf '%s' '{probe_migration}'"
+            " > /data/Modules/TestMod/Database/Migrations/"
+            "2020_01_01_000000_create_testmod_probe_table.php && "
+            "echo 'body{}' > /data/Modules/TestMod/Public/css/module.css",
+        )
+        _sh(
+            "docker", "run", "-d", "--name", pg, "--network", net,
+            "-e", "POSTGRES_PASSWORD=test",
+            "-e", "POSTGRES_DB=freescout",
+            "postgres:16",
+        )
+        _wait_pg_ready(pg)
+
+        start_fs(fs)
+        port = _host_port(fs, "8080")
+        try:
+            _wait_http_200(f"http://127.0.0.1:{port}/login", READY_DEADLINE_S)
+        except RuntimeError:
+            print(_sh("docker", "logs", fs, check=False).stdout)
+            print(_sh("docker", "logs", fs, check=False).stderr)
+            raise
+
+        yield {"fs": fs, "pg": pg, "net": net, "port": port, "vol": vol,
+               "start_fs": start_fs}
+    finally:
+        for name in containers + [pg]:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        subprocess.run(["docker", "network", "rm", net], capture_output=True)
+        subprocess.run(["docker", "volume", "rm", vol], capture_output=True)
+
+
+MODULE_LINK = "/var/www/html/public/modules/testmod"
+MODULE_CSS = MODULE_LINK + "/css/module.css"
+
+
+def test_module_public_symlink_seeded_across_fresh_containers(module_stack):
+    # public/ lives in the image layer, so the public/modules/<alias>
+    # symlinks vanish whenever the container is recreated (which on podman
+    # quadlet/pod platforms is every restart AND every image update). Until
+    # the bootstrap re-seeds them, every page referencing module assets
+    # 500s in the minify provider ("File ... does not exist"). Assert the
+    # links exist after first boot, reappear in a fresh container on the
+    # same volume, and are seeded BEFORE the DB wait so the assets resolve
+    # for the whole migration window.
+    fs = module_stack["fs"]
+    r = _exec(fs, "test", "-L", MODULE_LINK)
+    assert r.returncode == 0, f"{MODULE_LINK} is not a symlink after first boot"
+    r = _exec(fs, "test", "-f", MODULE_CSS)
+    assert r.returncode == 0, "module css does not resolve through the symlink"
+
+    # The module's probe migration must have actually run — guards against
+    # module migrations regressing to the silent module:migrate no-op (see
+    # the module_stack fixture comment).
+    r = _exec(
+        module_stack["pg"], "psql", "-U", "postgres", "-d", "freescout", "-tAc",
+        "select 1 from information_schema.tables where table_name='testmod_probe'",
+    )
+    assert r.stdout.strip() == "1", (
+        f"module probe migration did not run (psql said {r.stdout!r} {r.stderr!r})"
+    )
+
+    # Fresh container on the same volume, with the DB down: the bootstrap
+    # parks in wait_for_db, so the symlink appearing now proves seeding
+    # happens filesystem-only, before any DB dependency.
+    _sh("docker", "rm", "-f", fs)
+    _sh("docker", "stop", module_stack["pg"])
+    fs2 = fs + "-fresh"
+    module_stack["start_fs"](fs2)
+
+    end = time.time() + 60
+    while time.time() < end:
+        if _exec(fs2, "test", "-L", MODULE_LINK).returncode == 0:
+            break
+        time.sleep(1)
+    else:
+        print(_sh("docker", "logs", fs2, check=False).stderr)
+        pytest.fail(f"{MODULE_LINK} not re-seeded in fresh container while DB down")
+
+    # Boot gate: while the bootstrap is parked in the DB wait, nginx must
+    # answer 500 — not 2xx/3xx (the app is not ready) and not 502/503/504
+    # (the liveness healthcheck would count those unhealthy and get a slow
+    # first boot killed by the restart policy).
+    port2 = _host_port(fs2, "8080")
+    end = time.time() + 60
+    status = None
+    while time.time() < end:
+        try:
+            with _http_get(f"http://127.0.0.1:{port2}/login", timeout=5) as r:
+                status = r.status
+            break
+        except urllib.error.HTTPError as e:
+            status = e.code
+            break
+        except (urllib.error.URLError, ConnectionError, TimeoutError):
+            time.sleep(1)  # nginx not accepting yet
+    if status is None:
+        print(_sh("docker", "logs", fs2, check=False).stderr)
+        pytest.fail("nginx never accepted a connection within 60s while DB down")
+    assert status == 500, f"expected boot-gate 500 while DB down, got {status}"
+
+    # Let the boot finish and confirm end-to-end resolution again.
+    _sh("docker", "start", module_stack["pg"])
+    _wait_pg_ready(module_stack["pg"])
+    port = _host_port(fs2, "8080")
+    try:
+        _wait_http_200(f"http://127.0.0.1:{port}/login", READY_DEADLINE_S)
+    except RuntimeError:
+        print(_sh("docker", "logs", fs2, check=False).stdout)
+        print(_sh("docker", "logs", fs2, check=False).stderr)
+        raise
+    r = _exec(fs2, "test", "-f", MODULE_CSS)
+    assert r.returncode == 0, "module css does not resolve in fresh container"
+
+
+def test_module_symlink_seeding_edge_cases():
+    # Exercise step 2b's edge cases by running the bootstrap oneshot
+    # directly with an unreachable DB and a 1s wait timeout: it dies at the
+    # DB wait, but symlink seeding has already run by then. No DB stack
+    # needed. Three modules, processed in glob order:
+    #
+    # - DangleMod (first): Public is a dangling symlink persisted on /data.
+    #   `mkdir -p` on it fails, which under set -e would kill this and every
+    #   later boot — the bootstrap must remove the dangling link and carry
+    #   on (a regression aborts seeding here and fails the TestMod asserts).
+    # - EvilMod: declared-but-invalid alias "../bad" must be skipped
+    #   outright — no traversal link at public/bad, and no silent fallback
+    #   link under the directory name (module-install would miss the module
+    #   under a substitute alias while exiting 0).
+    # - TestMod: a pre-existing real directory at public/modules/testmod.
+    #   BusyBox `ln -sfn` against it exits 0 and creates the link INSIDE
+    #   it; the bootstrap must move the directory aside first (mirroring
+    #   upstream ModuleInstall).
+    app_key = "base64:" + base64.b64encode(secrets.token_bytes(32)).decode()
+    script = (
+        "mkdir -p /data/Modules/DangleMod && "
+        "printf '%s' '{\"name\":\"DangleMod\",\"alias\":\"danglemod\"}'"
+        " > /data/Modules/DangleMod/module.json && "
+        "ln -s /nonexistent-target /data/Modules/DangleMod/Public && "
+        "mkdir -p /data/Modules/EvilMod/Public && "
+        "printf '%s' '{\"name\":\"EvilMod\",\"alias\":\"../bad\"}'"
+        " > /data/Modules/EvilMod/module.json && "
+        "mkdir -p /data/Modules/TestMod/Public/css && "
+        "printf '%s' '{\"name\":\"TestMod\",\"alias\":\"testmod\"}'"
+        " > /data/Modules/TestMod/module.json && "
+        "echo 'body{}' > /data/Modules/TestMod/Public/css/module.css && "
+        "mkdir -p /var/www/html/public/modules/testmod && "
+        # The base renames /etc/entrypoint.d scripts into
+        # /etc/s6-overlay/scripts/ (see test_image.py), so discover the
+        # bootstrap by pattern instead of hardcoding the mangled name, and
+        # fail distinctly if it is not there at all.
+        "boot=$(ls /etc/s6-overlay/scripts/ | grep -E 'freescout-bootstrap' | head -n1) && "
+        "test -n \"$boot\" || "
+        "{ echo 'no freescout-bootstrap script in /etc/s6-overlay/scripts/' >&2; exit 90; }; "
+        "DB_WAIT_TIMEOUT=1 sh \"/etc/s6-overlay/scripts/$boot\"; "
+        # Named checks: each failed post-condition prints its own CHECK
+        # FAILED line so a regression identifies itself in the test output.
+        "fail=0; "
+        "ck() { \"$@\" || { echo \"CHECK FAILED: $*\" >&2; fail=1; }; }; "
+        "ck test -L /var/www/html/public/modules/testmod; "
+        "ck test -f /var/www/html/public/modules/testmod/css/module.css; "
+        "ck test -L /var/www/html/public/modules/danglemod; "
+        "ck test -d /data/Modules/DangleMod/Public; "
+        "ck test ! -e /var/www/html/public/modules/evilmod; "
+        "ck test ! -e /var/www/html/public/bad; "
+        "exit $fail"
+    )
+    r = subprocess.run(
+        ["docker", "run", "--rm", "--entrypoint", "sh",
+         "-e", f"APP_KEY={app_key}",
+         "-e", "APP_URL=http://localhost:8080",
+         "-e", "DB_TYPE=pgsql",
+         "-e", "DB_HOST=127.0.0.1",
+         "-e", "DB_NAME=x", "-e", "DB_USER=x", "-e", "DB_PASS=x",
+         IMAGE, "-c", script],
+        capture_output=True, text=True, timeout=180,
+    )
+    assert r.returncode == 0, (
+        "module symlink-seeding edge cases failed — see CHECK FAILED lines\n"
+        f"{r.stderr[-2000:]}"
     )
 
 

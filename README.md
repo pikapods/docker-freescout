@@ -33,8 +33,10 @@ zero external dependencies — the fastest way to try the image:
 git clone https://github.com/pikapods/docker-freescout.git
 cd docker-freescout
 docker compose up -d
-# wait ~30s for first-boot migrations
-curl -I http://localhost:8080/login   # → HTTP/1.1 200 OK
+# until first-boot migrations finish, every request answers a plain
+# "HTTP/1.1 500" with body "FreeScout is starting…" — usually well under a
+# minute, longer on slow hardware or big upgrades
+curl -I http://localhost:8080/login   # → HTTP/1.1 200 OK when ready
 ```
 
 Default credentials are `admin@example.com` / `changeme` — change them
@@ -158,6 +160,11 @@ are logged and skipped.
 The image creates `/var/www/html/{storage,Modules,.env}` as symlinks into
 `/data` at build time. Anything you write under `/data/storage/` (uploads,
 logs, cache) survives container restarts and image upgrades.
+
+`public/` lives in the image layer, so the `public/modules/<alias>` symlinks
+that module installs create do not persist; the bootstrap re-seeds them from
+`/data/Modules/` on every boot, before the database wait, so module assets
+resolve from the first served request.
 
 ### User & permissions
 

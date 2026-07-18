@@ -109,10 +109,16 @@ RUN cd /var/www/html && (php artisan freescout:build || true)
 #
 # /data itself must exist and be owned by www-data: the container runs as a
 # non-root user (UID 82 on Alpine) which cannot create /data under /.
+#
+# The boot-gate sentinel ships raised: while it exists nginx answers every
+# request with 500 (server-opts.d/00-freescout-bootstrap-gate.conf), so no
+# request reaches PHP against a half-migrated schema. The bootstrap oneshot
+# removes it as its final step.
 RUN rm -rf /var/www/html/storage /var/www/html/Modules /var/www/html/.env \
     && ln -s /data/storage /var/www/html/storage \
     && ln -s /data/Modules /var/www/html/Modules \
     && ln -s /data/config /var/www/html/.env \
+    && touch /var/www/html/.freescout-bootstrap-incomplete \
     && mkdir -p /data \
     && chown www-data:www-data /data \
     && chown -R www-data:www-data /var/www/html

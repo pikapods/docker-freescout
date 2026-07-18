@@ -1,14 +1,57 @@
 #!/bin/sh
-# FreeScout bootstrap — s6 init oneshot. nginx + php-fpm start in parallel
-# and serve 5xx until this completes; the scheduler longrun waits on it.
+# FreeScout bootstrap — s6 init oneshot. nginx + php-fpm start in parallel,
+# but the boot gate (server-opts.d/00-freescout-bootstrap-gate.conf) answers
+# every request with 500 while the sentinel below exists, so no request
+# reaches PHP against a half-migrated schema; the sentinel is removed as the
+# final step here. The scheduler longrun additionally waits on this oneshot
+# via an s6 dependency.
+# public/ lives in the image layer, so the public/modules/<alias> symlinks
+# are re-seeded every boot, before the DB wait. DB-dependent steps run
+# migrate -> module-install -> after-app-update (same order as
+# nfrastack/container-freescout), so the final cache clear runs after all
+# schema changes.
 # POSIX sh. Pipelines are avoided so artisan exit status is never masked.
 set -eu
 
 APP_DIR=/var/www/html
 ENV_FILE=/data/config
+BOOT_GATE=$APP_DIR/.freescout-bootstrap-incomplete
 
 log() { printf '[freescout-bootstrap] %s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
+
+# Raise the boot gate. The image ships the sentinel, but a restarted (not
+# recreated) container keeps the filesystem where the previous boot removed
+# it — re-create it so restarts are gated too. The gap between nginx's first
+# accept and this line is the only ungated window on restart, and it is
+# narrow; recreated containers are gated from the very first request.
+touch "$BOOT_GATE"
+
+# module_alias_for_dir <dir/>: alias for the module. A declared alias is
+# authoritative — if it is present but not a safe path component, or the
+# JSON is malformed, output is empty and the module is skipped, never
+# silently renamed (module-install would miss it under a substitute alias
+# while exiting 0). Only a genuinely absent alias falls back to the
+# lowercased directory name, which must itself validate. The alias becomes
+# a path component under public/modules/ and an artisan argument, so
+# anything outside [A-Za-z0-9_.-] or starting with a dot/dash is unsafe.
+module_alias_for_dir() {
+    mad_state=$(php -r '
+        $j = json_decode(@file_get_contents($argv[1]), true);
+        if (!is_array($j)) { echo "bad"; exit; }
+        if (!array_key_exists("alias", $j)) { echo "absent"; exit; }
+        if (!is_string($j["alias"]) || $j["alias"] === "") { echo "bad"; exit; }
+        echo "ok " . $j["alias"];' "${1}module.json" 2>/dev/null) || mad_state=bad
+    case "$mad_state" in
+        "ok "*) mad_alias=${mad_state#ok } ;;
+        absent) mad_alias=$(basename "$1" | tr 'A-Z' 'a-z') ;;
+        *)      mad_alias="" ;;
+    esac
+    case "$mad_alias" in
+        .*|-*|*[!A-Za-z0-9_.-]*) mad_alias="" ;;
+    esac
+    printf '%s\n' "$mad_alias"
+}
 
 # ---------------------------------------------------------------------------
 # Pre-flight guard: refuse the /data/config-as-directory layout.
@@ -112,6 +155,44 @@ if [ ! -s /data/storage/app/public/.gitignore ]; then
     log "seeding /data/storage/app/public/.gitignore"
     printf '*\n!.gitignore\n' > /data/storage/app/public/.gitignore
 fi
+
+# ---------------------------------------------------------------------------
+# 2b. Seed public/modules/<alias> symlinks. public/ lives in the image layer,
+#     so the links freescout:module-install creates are gone on every fresh
+#     container — create them here, before the DB wait: pure filesystem, no
+#     artisan, so module assets resolve from the first ungated request even
+#     if the later module-install fails. module-install no-ops on an
+#     existing link. Directories without module.json are not modules and are
+#     skipped (step 8 logs a WARN for them).
+# ---------------------------------------------------------------------------
+mkdir -p "$APP_DIR"/public/modules
+for mod_dir in /data/Modules/*/; do
+    [ -f "${mod_dir}module.json" ] || continue
+    mod_alias=$(module_alias_for_dir "$mod_dir")
+    if [ -z "$mod_alias" ]; then
+        log "WARN: unusable alias in ${mod_dir}module.json; skipping symlink"
+        continue
+    fi
+    mod_link="$APP_DIR/public/modules/$mod_alias"
+    # BusyBox `ln -sfn` against an existing real directory exits 0 and
+    # creates the link *inside* it; move the directory aside first, like
+    # upstream ModuleInstall::createModulePublicSymlink does.
+    if [ -e "$mod_link" ] && [ ! -L "$mod_link" ]; then
+        log "moving aside non-symlink $mod_link"
+        mv "$mod_link" "${mod_link}_$(date +%Y%m%d%H%M%S)"
+    fi
+    # A dangling Public symlink persisted on /data makes `mkdir -p` fail and
+    # would kill every boot. Upstream ModuleInstall unlinks Public symlinks
+    # before recreating the directory; like 1b, only act on a dangling link —
+    # a live symlink resolves fine through the chain and stays.
+    if [ -L "${mod_dir}Public" ] && [ ! -e "${mod_dir}Public" ]; then
+        log "removing dangling symlink ${mod_dir}Public -> $(readlink "${mod_dir}Public")"
+        rm -f "${mod_dir}Public"
+    fi
+    mkdir -p "${mod_dir}Public"
+    log "seeding public symlink: public/modules/$mod_alias"
+    ln -sfn "$APP_DIR/Modules/$(basename "$mod_dir")/Public" "$mod_link"
+done
 
 # ---------------------------------------------------------------------------
 # 3. Patch /data/config (the .env). User state — never rewritten wholesale.
@@ -291,51 +372,100 @@ done
 unset pf_rc pf_tries
 
 # ---------------------------------------------------------------------------
-# 7. Install user modules. One alias at a time, no --force.
+# 7. Core migrations. Must run before module-install, whose module:migrate
+#    needs the current core schema. Artisan's exit code cannot distinguish a
+#    connection drop from a real failure, so on failure ask the guard: ping OK
+#    means the DB is fine and the failure was real — `fatal` callers die,
+#    `warn` callers log and carry on; ping 3/4 means the DB dropped mid-run —
+#    re-wait and retry (every command run through this helper is
+#    re-runnable). Bounded at 3 runs; a DB that keeps flapping is an
+#    environment problem, so exhausting the bound is fatal for everyone.
+# ---------------------------------------------------------------------------
+run_with_db_retry() {
+    rwdr_fatal=$1; rwdr_label=$2; shift 2
+    rwdr_attempt=1
+    while ! ( cd "$APP_DIR" && php artisan "$@" ) >&2; do
+        rwdr_ping_rc=0
+        ( cd "$APP_DIR" && freescout-db-guard ping ) >/dev/null 2>&1 || rwdr_ping_rc=$?
+        case "$rwdr_ping_rc" in
+            3|4) ;;
+            *)
+                if [ "$rwdr_fatal" = fatal ]; then
+                    die "$rwdr_label failed (did not complete)"
+                fi
+                log "WARN: $rwdr_label failed (DB is fine, so the failure is real); continuing boot"
+                break
+                ;;
+        esac
+        rwdr_attempt=$(( rwdr_attempt + 1 ))
+        [ "$rwdr_attempt" -le 3 ] || die "$rwdr_label failed 3 times with the DB dropping mid-run"
+        log "DB connection lost during $rwdr_label; re-waiting (attempt $rwdr_attempt/3)"
+        wait_for_db
+    done
+    unset rwdr_fatal rwdr_label rwdr_attempt rwdr_ping_rc
+}
+
+log "running database migrations"
+run_with_db_retry fatal "migrate" migrate --force --no-interaction
+
+# ---------------------------------------------------------------------------
+# 8. Install user modules. One alias at a time, no --force. Re-checks the
+#    public symlinks seeded in 2b, then runs each module's own migrations.
+#    freescout:module-install exits 0 on several real failures (unknown
+#    alias prints an error and returns; symlink errors are swallowed), so
+#    its status is only a WARN.
+#    The migrations must be run via `migrate --path`, NOT `module:migrate`:
+#    nwidart's MigrateCommand strips base_path() off the module's resolved
+#    path, and in this image Modules/ is a symlink into /data, so the
+#    module path resolves to /data/Modules/... — the strip never matches,
+#    Laravel prefixes base_path() back on, and every module migration is a
+#    silent "Nothing to migrate" (exit 0). The same no-op happens inside
+#    module-install and UI-triggered installs. `migrate --path` relative to
+#    base_path resolves through the symlink and reports an honest exit
+#    status.
+#    A real migration failure is only a WARN: one bad third-party module
+#    must not brick the whole helpdesk (fatal would crash-loop behind the
+#    boot gate, and the UI — the recovery path for disabling a module —
+#    would be unreachable). The module runs with a stale schema until
+#    fixed; the log says so.
 # ---------------------------------------------------------------------------
 if [ -d /data/Modules ]; then
     for mod_dir in /data/Modules/*/; do
         [ -d "$mod_dir" ] || continue
-        alias=""
-        if [ -f "${mod_dir}module.json" ]; then
-            alias=$(awk -F'"' '/"alias"[[:space:]]*:/ { print $4; exit }' "${mod_dir}module.json")
+        if [ ! -f "${mod_dir}module.json" ]; then
+            log "WARN: ${mod_dir} has no module.json; not a module, skipping"
+            continue
         fi
-        if [ -z "$alias" ]; then
-            alias=$(basename "$mod_dir" | tr 'A-Z' 'a-z')
+        mod_alias=$(module_alias_for_dir "$mod_dir")
+        if [ -z "$mod_alias" ]; then
+            log "WARN: unusable alias in ${mod_dir}module.json; skipping install"
+            continue
         fi
-        log "installing module: $alias"
-        if ! ( cd "$APP_DIR" && php artisan freescout:module-install "$alias" ) >&2; then
-            log "WARN: module-install $alias returned non-zero (already installed?)"
+        log "installing module: $mod_alias"
+        if ! ( cd "$APP_DIR" && php artisan freescout:module-install "$mod_alias" ) >&2; then
+            log "WARN: module-install $mod_alias returned non-zero"
+        fi
+        mod_dirname=$(basename "$mod_dir")
+        if [ -d "${mod_dir}Database/Migrations" ]; then
+            log "running migrations for module $mod_dirname"
+            run_with_db_retry warn "module migrations for $mod_dirname" \
+                migrate --path="Modules/$mod_dirname/Database/Migrations" --force
         fi
     done
 fi
 
 # ---------------------------------------------------------------------------
-# 8. freescout:after-app-update — runs migrations, clears cache, queue:restart,
-#    and module post-update hooks. Must succeed. Artisan's exit code cannot
-#    distinguish a connection drop from a migration bug, so on failure ask the
-#    guard: ping OK means the DB is fine and the failure was real (fatal);
-#    ping 3/4 means the DB dropped mid-run — re-wait and retry (the command is
-#    designed to be re-runnable every boot). Bounded at 3 runs.
+# 9. freescout:after-app-update — clears cache, re-runs migrations (no-op
+#    after step 7), queue:restart, module post-update hooks. Deliberately
+#    last: web traffic is served in parallel with this oneshot, and requests
+#    handled mid-migration can cache values computed off the old schema into
+#    /data/storage — the clear-cache inside this command discards them.
 # ---------------------------------------------------------------------------
 log "running freescout:after-app-update"
-aau_attempt=1
-while ! ( cd "$APP_DIR" && php artisan freescout:after-app-update ) >&2; do
-    aau_ping_rc=0
-    ( cd "$APP_DIR" && freescout-db-guard ping ) >/dev/null 2>&1 || aau_ping_rc=$?
-    case "$aau_ping_rc" in
-        3|4) ;;
-        *) die "freescout:after-app-update failed (migrations did not complete)" ;;
-    esac
-    aau_attempt=$(( aau_attempt + 1 ))
-    [ "$aau_attempt" -le 3 ] || die "freescout:after-app-update failed 3 times with the DB dropping mid-run"
-    log "DB connection lost during after-app-update; re-waiting (attempt $aau_attempt/3)"
-    wait_for_db
-done
-unset aau_attempt aau_ping_rc
+run_with_db_retry fatal "freescout:after-app-update" freescout:after-app-update
 
 # ---------------------------------------------------------------------------
-# 9. Seed admin if first boot and ADMIN_EMAIL is set.
+# 10. Seed admin if first boot and ADMIN_EMAIL is set.
 #    users-count goes through the PHP guard so the bootstrap stays
 #    driver-agnostic — all Laravel-aware DB logic lives in one place.
 # ---------------------------------------------------------------------------
@@ -378,4 +508,6 @@ if [ -n "${ADMIN_EMAIL:-}" ]; then
     fi
 fi
 
-log "bootstrap complete"
+# Open the boot gate: from here nginx routes requests to PHP normally.
+rm -f "$BOOT_GATE"
+log "bootstrap complete; web gate open"
