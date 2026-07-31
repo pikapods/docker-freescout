@@ -1,11 +1,12 @@
 # FreeScout image — self-maintained, derived from serversideup/php.
 # See README.md for design notes and usage.
 #
-# Build:
+# Build (FREESCOUT_VERSION is required — there is deliberately no default, so a
+# build can never silently produce a stale version):
 #   podman build \
-#     --build-arg FREESCOUT_VERSION=1.8.219 \
+#     --build-arg FREESCOUT_VERSION=1.8.232 \
 #     --build-arg PHP_VERSION=8.4 \
-#     -t ghcr.io/pikapods/docker-freescout:1.8.219 .
+#     -t ghcr.io/pikapods/docker-freescout:1.8.232 .
 #
 # CI also passes BASE_IMAGE (digest-pinned), BASE_DIGEST, IMAGE_REVISION,
 # GIT_SHA, and BUILD_DATE to populate OCI labels and pin the base. Local
@@ -20,7 +21,7 @@ FROM ${BASE_IMAGE}
 
 # Re-declare PHP_VERSION post-FROM so it's visible to LABEL below.
 ARG PHP_VERSION
-ARG FREESCOUT_VERSION=1.8.219
+ARG FREESCOUT_VERSION
 ARG FREESCOUT_REPO=https://github.com/freescout-helpdesk/freescout
 # Build-identity args populated by CI. Defaults keep local builds working.
 ARG IMAGE_REVISION=r1
@@ -43,7 +44,14 @@ USER root
 # Runtime + build dependencies.
 # Runtime: postgresql-client (pg_isready), mysql-client (mysqladmin ping), tzdata.
 # No dcron — the scheduler runs as an s6 longrun service.
-RUN apk add --no-cache \
+#
+# The FREESCOUT_VERSION guard rides along here rather than on the clone below:
+# an unset ARG expands to "" and `git clone --branch=""` fails without naming
+# the cause. On this first RUN it fails in seconds, not after the extension
+# compile, and costs no extra layer.
+RUN [ -n "${FREESCOUT_VERSION}" ] \
+        || { echo "FREESCOUT_VERSION build-arg is required" >&2; exit 1; } \
+    && apk add --no-cache \
         git \
         postgresql-client \
         mysql-client \

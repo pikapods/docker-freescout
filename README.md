@@ -177,7 +177,7 @@ surface on the host depends on your runtime; pick the row that matches:
 | Named volume (docker or podman)        | Nothing — daemon manages ownership. Default in `compose.yaml`.                                               | Inside daemon-managed volume; not user-visible. |
 | Bind mount, rootful docker/podman      | `chown -R 82:82 <host-dir>` before first boot.                                                               | `82:82`.                              |
 | Bind mount, rootless podman            | Add `--userns=keep-id:uid=82,gid=82` to `podman run`.                                                        | Invoking host user's UID/GID.         |
-| Custom-UID rebuild                     | `docker build --build-arg WWW_DATA_UID=$(id -u) --build-arg WWW_DATA_GID=$(id -g) -t freescout:local .`      | The UID baked at build time.          |
+| Custom-UID rebuild                     | `docker build --build-arg FREESCOUT_VERSION=1.8.232 --build-arg WWW_DATA_UID=$(id -u) --build-arg WWW_DATA_GID=$(id -g) -t freescout:local .` | The UID baked at build time.          |
 
 The bootstrap runs a preflight writability check on `/data` and refuses to
 start with a readable error if ownership is wrong, rather than failing
@@ -242,10 +242,14 @@ patches*, not the canonical source.
 
 ```bash
 docker build \
-  --build-arg FREESCOUT_VERSION=1.8.219 \
+  --build-arg FREESCOUT_VERSION=1.8.232 \
   --build-arg PHP_VERSION=8.4 \
   -t freescout:test .
 ```
+
+`FREESCOUT_VERSION` is required — the Dockerfile deliberately has no default so
+a build can't silently produce a stale version. `PHP_VERSION` and `BASE_IMAGE`
+do have defaults.
 
 On podman, add `--format docker` — see the podman notes in Quick start for
 why. The CI build pushes Docker-format manifests for the same reason.

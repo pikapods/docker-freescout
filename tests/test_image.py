@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 
 import pytest
@@ -189,6 +190,42 @@ class TestImageFilesystem:
         )
 
 
+def _rebuild_build_args(labels):
+    """Recover the build args of the image under test from its OCI labels.
+
+    The rebuild below must reproduce the image under test, not the Dockerfile
+    defaults. Passing only WWW_DATA_UID/GID once had CI rebuilding a stale
+    FreeScout against an unpinned base and asserting against that instead of
+    the artifact that ships.
+    """
+    version = labels.get("org.opencontainers.image.version", "")
+    m = re.fullmatch(r"(?P<version>.+)-r\d+", version)
+    if not m:
+        pytest.fail(
+            "cannot derive FREESCOUT_VERSION: label "
+            f"org.opencontainers.image.version={version!r} is missing or not "
+            "in <version>-r<n> form"
+        )
+    args = [f"FREESCOUT_VERSION={m.group('version')}"]
+
+    # BASE_IMAGE alone pins the base, so PHP_VERSION is not worth deriving:
+    # post-FROM it only feeds the base.name label, and the base image's own
+    # ENV PHP_VERSION shadows the ARG there anyway (which is why base.name
+    # carries the patch version, e.g. 8.4.23, not the 8.4 CI passes).
+    #
+    # base.digest is empty for local builds (ARG BASE_DIGEST=); fall back to
+    # the tag-based reference so those still rebuild against the same base.
+    base_name = labels.get("org.opencontainers.image.base.name", "")
+    repo, _, _ = base_name.partition(":")
+    digest = labels.get("org.opencontainers.image.base.digest", "")
+    if repo and digest:
+        args.append(f"BASE_IMAGE={repo}@{digest}")
+    elif base_name:
+        args.append(f"BASE_IMAGE={base_name}")
+
+    return args
+
+
 # Marked runtime: a full image rebuild (~30s with buildkit cache, minutes
 # cold). Lives outside TestImageFilesystem so `-m 'not runtime'` keeps the
 # fast image lane fast.
@@ -207,16 +244,19 @@ class TestCustomUidRebuild:
     def image(self):
         ctx = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         tag = f"fs-uid{self.UID}-test"
+        build_args = _rebuild_build_args(_inspect()["Config"].get("Labels") or {}) + [
+            f"WWW_DATA_UID={self.UID}",
+            f"WWW_DATA_GID={self.GID}",
+        ]
+        flags = [f for arg in build_args for f in ("--build-arg", arg)]
         r = subprocess.run(
-            ["docker", "build",
-             "--build-arg", f"WWW_DATA_UID={self.UID}",
-             "--build-arg", f"WWW_DATA_GID={self.GID}",
-             "-t", tag, ctx],
+            ["docker", "build", *flags, "-t", tag, ctx],
             capture_output=True, text=True,
         )
         if r.returncode != 0:
             pytest.fail(
                 f"docker build failed (rc={r.returncode})\n"
+                f"build args: {build_args}\n"
                 f"--- stdout ---\n{r.stdout}\n--- stderr ---\n{r.stderr}"
             )
         try:
