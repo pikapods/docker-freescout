@@ -149,6 +149,15 @@ jobs:
             IMAGE_REVISION=${{ steps.rev.outputs.revision }}
             GIT_SHA=${{ github.sha }}
             BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          # composer_auth lifts Composer's api.github.com budget from the
+          # unauthenticated 60/hour-per-IP (shared across runners behind the
+          # same NAT) to the token's allowance. Without it the solver run in
+          # `composer require` hits a 403, decides the VCS repos are private,
+          # and falls back to an SSH clone the image cannot perform. The
+          # Dockerfile also rewrites that fallback to HTTPS, so a build with no
+          # secret still succeeds -- see the composer RUN there.
+          secrets: |
+            composer_auth={"github-oauth":{"github.com":"${{ secrets.GITHUB_TOKEN }}"}}
           tags: freescout:test
           provenance: false
 

@@ -95,7 +95,34 @@ RUN git clone --depth=1 --branch="${FREESCOUT_VERSION}" \
 # unconditionally, which constructs Faker\Factory and fatals with
 # "Class Faker\Factory not found". Pin matches FreeScout's require-dev so
 # the overrides/fzaninotto/faker autoload patches still line up.
-RUN cd /var/www/html \
+#
+# The `composer require` re-runs the solver, which (unlike `composer install`,
+# served entirely from composer.lock and dist archives) makes Composer
+# enumerate the two VCS `repositories` FreeScout declares —
+# freescout-help-desk/{laravel-selfupdater,Purifier} — through api.github.com.
+# Unauthenticated that budget is 60 requests/hour PER IP, shared across every
+# CI runner behind the same NAT. On the resulting 403 Composer assumes the repo
+# is private and, unable to prompt under --no-interaction, falls back to
+# `git clone git@github.com:...` — SSH, which this image has no client for:
+#
+#   Failed to clone the git@github.com:freescout-help-desk/laravel-selfupdater.git
+#   repository, try running in interactive mode ...
+#   error: cannot run ssh: No such file or directory
+#
+# Two independent guards, because the failure needs both to be robust:
+#   - insteadOf rewrites that fallback to HTTPS, which resolves anonymously for
+#     both (public) repos. Covers every build, including the UID-rebuild in
+#     tests/test_image.py, which gets no secret.
+#   - COMPOSER_AUTH from an optional build secret lifts the API budget so the
+#     fallback is rarely reached at all. CI feeds it the workflow's GITHUB_TOKEN;
+#     `required=false` keeps `podman build .` working with no secret at all.
+RUN --mount=type=secret,id=composer_auth,required=false \
+    if [ -s /run/secrets/composer_auth ]; then \
+        COMPOSER_AUTH="$(cat /run/secrets/composer_auth)"; \
+        export COMPOSER_AUTH; \
+    fi \
+    && git config --global url."https://github.com/".insteadOf "git@github.com:" \
+    && cd /var/www/html \
     && rm -rf vendor \
     && composer install \
         --no-dev \
