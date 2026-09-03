@@ -150,6 +150,23 @@ Matches the `tiredofit/docker-freescout` convention.
 match `[A-Z0-9_]+`. Invalid keys (dots, dashes, lowercase, regex metachars)
 are logged and skipped.
 
+### Outgoing mail: the SMTP `EHLO` name
+
+No knob, but worth knowing when a relay rejects your mail with `501
+Syntactically invalid EHLO argument(s)`. FreeScout (SwiftMailer) takes the
+`EHLO`/`HELO` argument from `$_SERVER['SERVER_NAME']`:
+
+- **Queued mail** (normal replies, sent by the scheduler's `queue:work`) —
+  FreeScout fills it from `APP_URL`.
+- **Synchronous sends** (the *Send Test Email* button) — nginx supplies it, and
+  this image passes the request `Host`, which FreeScout's `TrustHosts`
+  middleware already constrains to `APP_URL`'s host. A `Host` that isn't a
+  valid hostname is dropped rather than passed on, so SwiftMailer falls back to
+  `[127.0.0.1]` — never nginx's catch-all `_`, which is what strict relays
+  reject (see `rootfs/etc/nginx/conf.d/01-server-name.conf`).
+
+Set `APP_URL` to your real public URL and both paths announce that host.
+
 ## Mounts
 
 | Path                   | Purpose                                                          |

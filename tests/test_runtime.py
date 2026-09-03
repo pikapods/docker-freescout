@@ -334,6 +334,37 @@ def test_attachment_url_hidden_file_still_denied(stack):
     )
 
 
+def test_server_name_never_nginx_catchall(stack):
+    # SwiftMailer sends $_SERVER['SERVER_NAME'] as the SMTP EHLO argument, so
+    # nginx's catch-all `server_name _` reaching PHP means `EHLO _` and a 501
+    # from strict relays (pikapods/docker-freescout#1). conf.d/01-server-name.conf
+    # + fastcgi_params must pass the request Host instead, and nothing at all
+    # when the Host is unusable.
+    #
+    # Probe a bare PHP file rather than a route: TrustHosts would 403 the
+    # spoofed Host headers before any Laravel code echoed the value back.
+    probe = "/var/www/html/public/__servername.php"
+    write = _exec(
+        stack["fs"], "sh", "-c",
+        f"printf '%s' \"<?php echo \\$_SERVER['SERVER_NAME'] ?? 'UNSET';\" > {probe}",
+    )
+    assert write.returncode == 0, f"could not write probe: {write.stderr!r}"
+    try:
+        def body_for(host):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{stack['port']}/__servername.php",
+                headers={"Host": host},
+            )
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.read().decode("utf-8", errors="replace").strip()
+
+        assert body_for("mail.example.com") == "mail.example.com"
+        # No usable hostname -> unset, so SwiftMailer falls back to [127.0.0.1].
+        assert body_for("_") == "UNSET"
+    finally:
+        _exec(stack["fs"], "rm", "-f", probe)
+
+
 def test_logs_clean(stack):
     logs = _sh("docker", "logs", stack["fs"], check=False)
     combined = logs.stdout + logs.stderr

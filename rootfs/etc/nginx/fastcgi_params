@@ -1,8 +1,12 @@
 # Overrides /etc/nginx/fastcgi_params from the base image (serversideup/php).
-# Mirrors the upstream file VERBATIM except for the SERVER_PORT line, which is
-# fed by the $forwarded_server_port map in conf.d/00-forwarded-port.conf so the
-# PUBLIC port (not the container's internal 8080) reaches PHP behind a
-# TLS-terminating reverse proxy. See that file for the full rationale.
+# Mirrors the upstream file VERBATIM except for two lines, each fed by a map in
+# conf.d/ — see those files for the full rationale:
+#   - SERVER_PORT: $forwarded_server_port (conf.d/00-forwarded-port.conf) so the
+#     PUBLIC port (not the container's internal 8080) reaches PHP behind a
+#     TLS-terminating reverse proxy.
+#   - SERVER_NAME: $freescout_server_name (conf.d/01-server-name.conf) so PHP
+#     never sees nginx's catch-all `_`, which SwiftMailer would send as the SMTP
+#     EHLO argument.
 #
 # This is the only injection point that reaches the PHP location: the base
 # image's `location ~ \.php$` (site-opts.d/http.conf) defines its own
@@ -35,7 +39,11 @@ fastcgi_param  REMOTE_PORT        $remote_port;
 fastcgi_param  SERVER_ADDR        $server_addr;
 # SERVER_PORT: public port behind a proxy (see conf.d/00-forwarded-port.conf).
 fastcgi_param  SERVER_PORT        $forwarded_server_port;
-fastcgi_param  SERVER_NAME        $server_name;
+# SERVER_NAME: SwiftMailer's EHLO name (see conf.d/01-server-name.conf).
+# if_not_empty: an unusable Host leaves SERVER_NAME unset rather than empty —
+# the same state the CLI SAPI has, which is what upstream's empty() checks
+# (SwiftMailer's transport_deps.php, FreeScout's Console\Kernel) expect.
+fastcgi_param  SERVER_NAME        $freescout_server_name if_not_empty;
 
 # PHP only, required if PHP was built with --enable-force-cgi-redirect
 fastcgi_param  REDIRECT_STATUS    200;
