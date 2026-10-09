@@ -183,9 +183,11 @@ that module installs create do not persist; the bootstrap re-seeds them from
 `/data/Modules/` on every boot, before the database wait, so module assets
 resolve from the first served request.
 
-OPcache is off by default (`PHP_OPCACHE_ENABLE=0`). If you enable it, the base
-image also sets `PHP_OPCACHE_VALIDATE_TIMESTAMPS=0`, so code from modules
-installed or updated via the UI only loads after a container restart.
+OPcache is on for php-fpm (`PHP_OPCACHE_ENABLE=1`) with
+`PHP_OPCACHE_VALIDATE_TIMESTAMPS=1`, so modules installed or updated via the UI
+load without a restart. Setting `PHP_OPCACHE_VALIDATE_TIMESTAMPS=0` saves a
+little per request but then needs a container restart after every module
+change.
 
 ### User & permissions
 

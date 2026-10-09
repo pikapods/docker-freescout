@@ -61,6 +61,16 @@ class TestImageMetadata:
         assert env.get("ENABLE_FREESCOUT_SCHEDULER") == "TRUE"
         assert env.get("APP_BASE_DIR") == "/var/www/html"
 
+    def test_stop_signal_sigterm(self, inspect):
+        # s6's /init ignores the base's SIGQUIT; stops would always end in SIGKILL.
+        assert inspect["Config"].get("StopSignal") == "SIGTERM"
+
+    def test_opcache_defaults(self):
+        r = _run("php", "-r", 'echo ini_get("opcache.enable"), ini_get("opcache.enable_cli"),'
+                 ' ini_get("opcache.validate_timestamps");')
+        assert r.returncode == 0, r.stderr
+        assert r.stdout == "101", f"enable/enable_cli/validate_timestamps = {r.stdout!r}"
+
 
 class TestImageFilesystem:
     @pytest.mark.parametrize("link,target", [

@@ -198,10 +198,23 @@ RUN chmod +x /usr/local/bin/freescout-bootstrap \
 # SSL_MODE=off: TLS terminates at the reverse proxy.
 # ENABLE_FREESCOUT_SCHEDULER=TRUE: FreeScout is broken without scheduled tasks
 # (mail fetch, queues). Intentional break from tiredofit's FALSE default.
+# OPcache on (~6x faster /login), but keep timestamp validation: modules
+# installed from the UI land in /data/Modules and must load without a restart.
+# Off for the CLI: schedule:run spawns a fresh php each minute, so a per-process
+# cache only costs startup time.
 ENV AUTORUN_ENABLED=false \
     SSL_MODE=off \
     ENABLE_FREESCOUT_SCHEDULER=TRUE \
-    APP_BASE_DIR=/var/www/html
+    APP_BASE_DIR=/var/www/html \
+    PHP_OPCACHE_ENABLE=1 \
+    PHP_OPCACHE_VALIDATE_TIMESTAMPS=1 \
+    PHP_OPCACHE_ENABLE_CLI=0
+
+# The base's SIGQUIT is ignored by s6's /init, so every stop ran into the
+# runtime timeout and ended in SIGKILL (killing queue:work mid-send). On SIGTERM
+# s6 shuts services down via their down-signal files, which is SIGQUIT (graceful)
+# for nginx and php-fpm.
+STOPSIGNAL SIGTERM
 
 # Health probe hits /login (full nginx + php-fpm + Laravel path) with liveness
 # semantics: only transport failures and 502/503/504 mark the container

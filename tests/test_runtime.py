@@ -1220,3 +1220,38 @@ def test_wrong_password_waits_with_credential_hint(db_wait_resources):
     assert "check DB_USER/DB_PASS/DB_NAME" in _logs(fs), (
         f"expected credential hint in wait-loop logs; logs:\n{_logs(fs)}"
     )
+
+
+def test_stop_is_graceful(db_wait_resources):
+    # s6's /init ignores SIGQUIT (the base's STOPSIGNAL): every stop ran into
+    # the timeout and ended in SIGKILL / exit 137. With SIGTERM s6 tears the
+    # services down itself well inside the timeout.
+    suffix = secrets.token_hex(4)
+    net, pg, fs = f"fs-net-{suffix}", f"pg-{suffix}", f"fs-{suffix}"
+    db_wait_resources["networks"].append(net)
+    db_wait_resources["containers"].extend([pg, fs])
+
+    _sh("docker", "network", "create", net)
+    _sh(
+        "docker", "run", "-d", "--name", pg, "--network", net,
+        "-e", "POSTGRES_PASSWORD=test",
+        "-e", "POSTGRES_DB=freescout",
+        "postgres:16",
+    )
+    _wait_pg_ready(pg)
+    _run_freescout(net, fs, pg)
+    port = _host_port(fs, "8080")
+    try:
+        _wait_http_200(f"http://127.0.0.1:{port}/login", READY_DEADLINE_S)
+    except RuntimeError:
+        print(_logs(fs))
+        raise
+
+    start = time.monotonic()
+    _sh("docker", "stop", "-t", "30", fs)
+    elapsed = time.monotonic() - start
+    r = _sh("docker", "inspect", "--format", "{{.State.ExitCode}}", fs)
+    assert r.stdout.strip() == "0", (
+        f"exit code {r.stdout.strip()} after {elapsed:.1f}s; logs:\n{_logs(fs)}"
+    )
+    assert elapsed < 15, f"stop took {elapsed:.1f}s"
