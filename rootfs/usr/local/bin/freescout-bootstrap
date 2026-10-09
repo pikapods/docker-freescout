@@ -1,5 +1,8 @@
-#!/bin/sh
-# FreeScout bootstrap — s6 init oneshot. nginx + php-fpm start in parallel,
+#!/command/with-contenv sh
+# FreeScout bootstrap — standalone s6 oneshot (s6-rc.d/freescout-bootstrap).
+# Deliberately not in /etc/entrypoint.d: the base's s6-init would chain
+# nginx/php-fpm behind it, so they would not serve until the DB is up.
+# nginx + php-fpm start in parallel with this oneshot,
 # but the boot gate (server-opts.d/00-freescout-bootstrap-gate.conf) answers
 # every request with 500 while the sentinel below exists, so no request
 # reaches PHP against a half-migrated schema; the sentinel is removed as the

@@ -183,6 +183,10 @@ that module installs create do not persist; the bootstrap re-seeds them from
 `/data/Modules/` on every boot, before the database wait, so module assets
 resolve from the first served request.
 
+OPcache is off by default (`PHP_OPCACHE_ENABLE=0`). If you enable it, the base
+image also sets `PHP_OPCACHE_VALIDATE_TIMESTAMPS=0`, so code from modules
+installed or updated via the UI only loads after a container restart.
+
 ### User & permissions
 
 Both nginx and php-fpm run as `www-data` (**UID 82 / GID 82** — Alpine's

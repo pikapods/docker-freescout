@@ -816,14 +816,7 @@ def test_module_symlink_seeding_edge_cases():
         " > /data/Modules/TestMod/module.json && "
         "echo 'body{}' > /data/Modules/TestMod/Public/css/module.css && "
         "mkdir -p /var/www/html/public/modules/testmod && "
-        # The base renames /etc/entrypoint.d scripts into
-        # /etc/s6-overlay/scripts/ (see test_image.py), so discover the
-        # bootstrap by pattern instead of hardcoding the mangled name, and
-        # fail distinctly if it is not there at all.
-        "boot=$(ls /etc/s6-overlay/scripts/ | grep -E 'freescout-bootstrap' | head -n1) && "
-        "test -n \"$boot\" || "
-        "{ echo 'no freescout-bootstrap script in /etc/s6-overlay/scripts/' >&2; exit 90; }; "
-        "DB_WAIT_TIMEOUT=1 sh \"/etc/s6-overlay/scripts/$boot\"; "
+        "DB_WAIT_TIMEOUT=1 sh /usr/local/bin/freescout-bootstrap; "
         # Named checks: each failed post-condition prints its own CHECK
         # FAILED line so a regression identifies itself in the test output.
         "fail=0; "

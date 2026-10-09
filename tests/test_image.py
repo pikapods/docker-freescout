@@ -103,35 +103,53 @@ class TestImageFilesystem:
     def test_s6_scheduler_depends_on_bootstrap(self):
         r = _run(
             "test", "-f",
-            "/etc/s6-overlay/s6-rc.d/freescout-scheduler/dependencies.d/20-freescout-bootstrap",
+            "/etc/s6-overlay/s6-rc.d/freescout-scheduler/dependencies.d/freescout-bootstrap",
         )
         assert r.returncode == 0, "scheduler dependency marker on bootstrap missing"
 
-    @pytest.mark.parametrize("service,dep", [
-        ("nginx", "10-init-webserver-config"),
-        ("php-fpm", "5-fpm-pool-user"),
-    ])
-    def test_s6_service_ordered_after_config_oneshot(self, service, dep):
-        # The base image starts nginx in parallel with the oneshot that
-        # renders nginx.conf and creates the conf.d/default.conf symlink
-        # (created last). A fresh container losing that race loads a valid
-        # but server-less config, binds nothing, and wedges until recreated.
-        # The Dockerfile appends these deps after docker-php-serversideup-s6-init.
-        r = _run("cat", f"/etc/s6-overlay/s6-rc.d/{service}/dependencies")
-        assert r.returncode == 0, f"{service} dependencies file missing: {r.stderr}"
-        assert dep in r.stdout.split(), (
-            f"{service} must depend on {dep}; got {r.stdout!r}"
-        )
+    def test_s6_dependency_closure(self):
+        # nginx/php-fpm must start after the config oneshots (a fresh container
+        # whose nginx wins the race against 10-init-webserver-config loads a
+        # server-less config and wedges), but never after the bootstrap: nginx
+        # has to serve the boot gate and /healthcheck while it waits for the DB.
+        r = _run("sh", "-c",
+                 "cd /etc/s6-overlay/s6-rc.d && "
+                 "for f in */dependencies.d/*; do echo \"$f\"; done")
+        assert r.returncode == 0, r.stderr
+        deps = {}
+        for line in r.stdout.split():
+            svc, _, dep = line.split("/")
+            deps.setdefault(svc, set()).add(dep)
+
+        def closure(svc):
+            seen, stack = set(), [svc]
+            while stack:
+                for d in deps.get(stack.pop(), ()):
+                    if d not in seen:
+                        seen.add(d)
+                        stack.append(d)
+            return seen
+
+        nginx, fpm = closure("nginx"), closure("php-fpm")
+        assert "10-init-webserver-config" in nginx, sorted(nginx)
+        assert "5-fpm-pool-user" in fpm, sorted(fpm)
+        assert "freescout-bootstrap" not in nginx, sorted(nginx)
+        assert "freescout-bootstrap" not in fpm, sorted(fpm)
+
+    def test_s6_user_bundle_layout(self):
+        # s6-overlay >= 3.2.3 ignores user-bundles.d entirely if the legacy
+        # s6-rc.d/user exists, then fails writing its type file as www-data.
+        r = _run("sh", "-c",
+                 "test ! -e /etc/s6-overlay/s6-rc.d/user && "
+                 "cd /etc/s6-overlay/user-bundles.d/user/contents.d && "
+                 "test -f freescout-bootstrap && test -f freescout-scheduler")
+        assert r.returncode == 0, "s6 user bundle layout wrong"
 
     def test_s6_bootstrap_oneshot_installed(self):
-        # The base image's docker-php-serversideup-s6-init moves our
-        # /etc/entrypoint.d/20-freescout-bootstrap.sh into /etc/s6-overlay/scripts/
-        # with a rename suffix we don't want to couple to — glob is deliberate.
-        r = _run("sh", "-c", "ls /etc/s6-overlay/scripts/ | grep -E 'freescout-bootstrap'")
-        assert r.returncode == 0, (
-            "no freescout-bootstrap script in /etc/s6-overlay/scripts/ "
-            f"(stdout={r.stdout!r}, stderr={r.stderr!r})"
-        )
+        r = _run("test", "-x", "/usr/local/bin/freescout-bootstrap")
+        assert r.returncode == 0, "freescout-bootstrap missing or not executable"
+        r = _run("cat", "/etc/s6-overlay/s6-rc.d/freescout-bootstrap/type")
+        assert r.stdout.strip() == "oneshot", r.stdout
 
     def test_boot_gate_sentinel_shipped_raised(self):
         # The boot gate must be closed from the very first request of a

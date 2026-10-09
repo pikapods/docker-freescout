@@ -172,34 +172,25 @@ RUN if [ "$WWW_DATA_UID" != "82" ] || [ "$WWW_DATA_GID" != "82" ]; then \
 
 VOLUME /data
 
-# Overlay our entrypoint hook + s6 scheduler service + nginx site config.
+# Overlay our s6 bootstrap/scheduler services + nginx site config.
 COPY rootfs/ /
 
-# - chmod *before* docker-php-serversideup-s6-init: the init tool moves
-#   /etc/entrypoint.d/*.sh into /etc/s6-overlay/scripts/ and renames them, so
-#   chmod afterwards at the original path would fail.
 # - chown /etc/nginx to www-data: ServerSideUp's 10-init-webserver-config
 #   runs as www-data and renders /etc/nginx/nginx.conf at boot. After our
 #   COPY rootfs/ the directory ends up root-owned and nginx fails to start
 #   with "Permission denied" opening nginx.conf.
-# - The two `dependencies` appends order nginx/php-fpm after the base's config
-#   oneshots. Upstream starts nginx in parallel with 10-init-webserver-config,
-#   which renders nginx.conf and creates the conf.d/default.conf symlink (the
-#   only path a server block reaches nginx) as its LAST step. On a fresh
-#   container nginx can win that race and load a valid but server-less config:
-#   it binds nothing, /healthcheck is connection-refused forever, the s6-rc
-#   transition never settles, and the pod wedges until the restart policy
-#   recreates it. php-fpm races 5-fpm-pool-user (pool template) the same way
-#   but self-heals via restart; ordered here for symmetry.
-RUN chmod +x /etc/entrypoint.d/20-freescout-bootstrap.sh \
+# - docker-php-serversideup-s6-init converts the base's own entrypoint.d
+#   scripts into chained oneshots and orders nginx/php-fpm after the last one,
+#   so both start only once their config is rendered. Our bootstrap is a
+#   hand-written oneshot outside that chain on purpose: nginx must serve the
+#   boot gate and /healthcheck while the bootstrap waits for the DB.
+RUN chmod +x /usr/local/bin/freescout-bootstrap \
              /etc/s6-overlay/s6-rc.d/freescout-scheduler/run \
              /usr/local/bin/freescout-db-guard \
              /usr/local/bin/freescout-healthcheck \
     && rm /etc/nginx/server-opts.d/security.conf \
     && chown -R www-data:www-data /etc/nginx \
-    && docker-php-serversideup-s6-init \
-    && printf '\n10-init-webserver-config\n' >> /etc/s6-overlay/s6-rc.d/nginx/dependencies \
-    && printf '\n5-fpm-pool-user\n' >> /etc/s6-overlay/s6-rc.d/php-fpm/dependencies
+    && docker-php-serversideup-s6-init
 
 # Image defaults.
 # AUTORUN_ENABLED=false: we own the boot sequence; the base's laravel-automations
