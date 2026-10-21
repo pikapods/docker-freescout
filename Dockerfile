@@ -49,6 +49,12 @@ USER root
 # an unset ARG expands to "" and `git clone --branch=""` fails without naming
 # the cause. On this first RUN it fails in seconds, not after the extension
 # compile, and costs no extra layer.
+#
+# Pin the two PECL extensions to official release archives matching the published
+# image (gnupg 1.5.4, imap 1.0.3). PECL's release lookup repeatedly returned
+# "No releases available" for gnupg in CI. Download with retries and verify
+# checksums before extracting. PECL archives keep package.xml beside the source
+# directory; move it inside so the installer can build from a local directory.
 RUN [ -n "${FREESCOUT_VERSION}" ] \
         || { echo "FREESCOUT_VERSION build-arg is required" >&2; exit 1; } \
     && apk add --no-cache \
@@ -56,19 +62,37 @@ RUN [ -n "${FREESCOUT_VERSION}" ] \
         postgresql-client \
         mysql-client \
         tzdata \
+    && mkdir -p /tmp/freescout-php-extensions \
+    && for extension_spec in \
+        gnupg-1.5.4:4d4a0980759bf259e4129ef02cb592bbeb103b4005e7b4bb6945d79488951a50 \
+        imap-1.0.3:0c2c0b1f94f299004be996b85a424e3d11ff65ac0a3c980db3213289a4a3faaf; do \
+        extension_release="${extension_spec%%:*}"; \
+        extension_sha256="${extension_spec#*:}"; \
+        curl --fail --location --retry 3 --connect-timeout 15 --max-time 120 \
+            "https://pecl.php.net/get/${extension_release}.tgz" \
+            -o "/tmp/freescout-php-extensions/${extension_release}.tgz" \
+        && printf '%s  %s\n' "${extension_sha256}" \
+            "/tmp/freescout-php-extensions/${extension_release}.tgz" | sha256sum -c - \
+        && tar -xzf "/tmp/freescout-php-extensions/${extension_release}.tgz" \
+            -C /tmp/freescout-php-extensions \
+        && mv /tmp/freescout-php-extensions/package.xml \
+            "/tmp/freescout-php-extensions/${extension_release}/package.xml" \
+        || exit 1; \
+    done \
     && install-php-extensions \
         pdo_pgsql \
         pgsql \
         pdo_mysql \
-        gnupg \
-        imap \
+        /tmp/freescout-php-extensions/gnupg-1.5.4 \
+        /tmp/freescout-php-extensions/imap-1.0.3 \
         intl \
         bcmath \
         gd \
         exif \
         pcntl \
         opcache \
-        redis
+        redis \
+    && rm -rf /tmp/freescout-php-extensions
 
 # Clone FreeScout at a pinned version. Source baked into the image —
 # image tag = app version, no in-data drift.
