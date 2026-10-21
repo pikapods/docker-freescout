@@ -50,11 +50,13 @@ USER root
 # the cause. On this first RUN it fails in seconds, not after the extension
 # compile, and costs no extra layer.
 #
-# Pin the two PECL extensions to official release archives matching the published
-# image (gnupg 1.5.4, imap 1.0.3). PECL's release lookup repeatedly returned
-# "No releases available" for gnupg in CI. Download with retries and verify
-# checksums before extracting. PECL archives keep package.xml beside the source
-# directory; move it inside so the installer can build from a local directory.
+# Pin gnupg 1.5.4 and imap 1.0.3 to their upstream GitHub release commits.
+# Neither release supports PIE. Avoid PECL's unreliable lookup/download servers
+# while retaining install-php-extensions for dependencies and local compilation.
+# GitHub archives contain package.xml but omit submodules: fetch gnupg's phpc
+# header at the release's recorded submodule commit separately. Verify every
+# download before use, and skip the helper's otherwise unconditional PECL channel
+# refresh in a temporary copy. Fail if that command changes upstream.
 RUN [ -n "${FREESCOUT_VERSION}" ] \
         || { echo "FREESCOUT_VERSION build-arg is required" >&2; exit 1; } \
     && apk add --no-cache \
@@ -64,22 +66,35 @@ RUN [ -n "${FREESCOUT_VERSION}" ] \
         tzdata \
     && mkdir -p /tmp/freescout-php-extensions \
     && for extension_spec in \
-        gnupg-1.5.4:4d4a0980759bf259e4129ef02cb592bbeb103b4005e7b4bb6945d79488951a50 \
-        imap-1.0.3:0c2c0b1f94f299004be996b85a424e3d11ff65ac0a3c980db3213289a4a3faaf; do \
+        gnupg-1.5.4:289a2e9ea6000462fb064a433771a70c1a8f39ff73aa13a6afffef53b6087b49:https://codeload.github.com/php-gnupg/php-gnupg/tar.gz/ced3b06792ead4898974ae95817f09479af843bb \
+        imap-1.0.3:fbd15d63b20e7bf5aeaf5da3c8052ca0530711f485c9f073e6c2d9ca4e760bec:https://codeload.github.com/php/pecl-mail-imap/tar.gz/c4a3fe6af70d62c133843dbe780d050fbe3d64f4; do \
         extension_release="${extension_spec%%:*}"; \
-        extension_sha256="${extension_spec#*:}"; \
+        extension_download="${extension_spec#*:}"; \
+        extension_sha256="${extension_download%%:*}"; \
+        extension_url="${extension_download#*:}"; \
         curl --fail --location --retry 3 --connect-timeout 15 --max-time 120 \
-            "https://pecl.php.net/get/${extension_release}.tgz" \
+            "${extension_url}" \
             -o "/tmp/freescout-php-extensions/${extension_release}.tgz" \
         && printf '%s  %s\n' "${extension_sha256}" \
             "/tmp/freescout-php-extensions/${extension_release}.tgz" | sha256sum -c - \
+        && mkdir -p "/tmp/freescout-php-extensions/${extension_release}" \
         && tar -xzf "/tmp/freescout-php-extensions/${extension_release}.tgz" \
-            -C /tmp/freescout-php-extensions \
-        && mv /tmp/freescout-php-extensions/package.xml \
-            "/tmp/freescout-php-extensions/${extension_release}/package.xml" \
+            --strip-components=1 -C "/tmp/freescout-php-extensions/${extension_release}" \
         || exit 1; \
     done \
-    && install-php-extensions \
+    && mkdir -p /tmp/freescout-php-extensions/gnupg-1.5.4/phpc \
+    && curl --fail --location --retry 3 --connect-timeout 15 --max-time 120 \
+        https://raw.githubusercontent.com/bukka/phpc/5dede0948d20a027536afb983d2f1eba07977c78/phpc.h \
+        -o /tmp/freescout-php-extensions/gnupg-1.5.4/phpc/phpc.h \
+    && printf '%s  %s\n' \
+        45727119d2c94c3e9f1718e4c4e06023fd87e329a4c24bdb089fb660ddce0f4e \
+        /tmp/freescout-php-extensions/gnupg-1.5.4/phpc/phpc.h | sha256sum -c - \
+    && extension_installer="$(command -v install-php-extensions)" \
+    && { [ "$(grep -Ec '^[[:space:]]*pecl channel-update pecl[.]php[.]net \|\| true$' "${extension_installer}")" = 1 ] \
+        || { echo "Unexpected install-php-extensions PECL channel-update command" >&2; exit 1; }; } \
+    && sed -E 's/^[[:space:]]*pecl channel-update pecl[.]php[.]net \|\| true$/: # Skip channel refresh for verified local sources./' \
+        "${extension_installer}" > /tmp/freescout-php-extensions/install-php-extensions \
+    && sh /tmp/freescout-php-extensions/install-php-extensions \
         pdo_pgsql \
         pgsql \
         pdo_mysql \

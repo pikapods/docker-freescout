@@ -319,6 +319,18 @@ do have defaults.
 On podman, add `--format docker` — see the podman notes in Quick start for
 why. The CI build pushes Docker-format manifests for the same reason.
 
+GnuPG 1.5.4 and IMAP 1.0.3 are built from their upstream GitHub release
+commits, with SHA-256 checksums checked before extraction. GnuPG's required
+`phpc.h` submodule header is fetched at its recorded commit and checked too.
+These releases lack PIE support, so `install-php-extensions` still handles
+system dependencies and local PECL compilation. A temporary copy of the helper
+skips its network channel refresh; the build fails clearly if that command
+changes upstream. This avoids contacting `pecl.php.net` during this image's
+build. Redis is already provided by the base image.
+
+When updating either extension, update its release commit and archive checksum
+in the Dockerfile, plus GnuPG's submodule commit and checksum if needed.
+
 ## License
 
 The FreeScout source is AGPL-3.0; this image inherits that license.

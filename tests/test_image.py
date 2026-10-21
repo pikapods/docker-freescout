@@ -115,6 +115,13 @@ class TestImageFilesystem:
         modules = {line.strip() for line in r.stdout.splitlines() if line.strip()}
         assert ext in modules, f"PHP module {ext!r} not loaded; got {sorted(modules)}"
 
+    @pytest.mark.parametrize("ext,version", [("gnupg", "1.5.4"), ("imap", "1.0.3")])
+    def test_pinned_extension_versions(self, ext, version):
+        r = _run("php", "-r", f'echo phpversion("{ext}");')
+        assert r.returncode == 0, r.stderr
+        assert not r.stderr, r.stderr
+        assert r.stdout == version, f"{ext}: expected {version}, got {r.stdout!r}"
+
     def test_s6_scheduler_run_executable(self):
         r = _run("test", "-x", "/etc/s6-overlay/s6-rc.d/freescout-scheduler/run")
         assert r.returncode == 0, "freescout-scheduler run script missing or not executable"
