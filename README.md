@@ -77,6 +77,48 @@ The compose file and `docker run` examples work as-is under
   probe spoofs `Host: <APP_URL host>` so FreeScout's `TrustHosts`
   middleware doesn't 403 the loopback request — works under any `APP_URL`.
 
+## Temporary PHP security guards (October 2026)
+
+As assessed on 21 October 2026 before the scheduled 14:00 UTC PHP release,
+the published `1.8.248-r2` image and `serversideup/php:8.4-fpm-nginx-alpine`
+both report PHP 8.4.26. Their shared base digest is
+`sha256:16c3ca4d650261714dd187c178f43c264c873d9733724594a7119a3e6738bc86`.
+Treat these images as potentially affected by **CVE-2026-109618** and
+**CVE-2026-109619**. Affected versions and exploitation prerequisites were
+not yet published in the [PHP announcement](https://www.php.net/archive/2026.php#2026-10-20-1).
+
+This image now disables `session.upload_progress.enabled` and rejects every
+request whose Content-Type contains `multipart` (case-insensitively) in nginx,
+before it reaches PHP. Rejected requests return HTTP 403 with an explanation.
+**Browser attachment uploads and other multipart forms are temporarily
+unavailable.** URL-encoded and JSON requests, attachment downloads, and normal
+health probes remain permitted. Both guards ship enabled without a runtime
+toggle.
+
+These are precautionary measures, **not confirmed protection against both
+CVEs**. They do not replace upgrading PHP.
+[CERT-EU](https://cert.europa.eu/publications/security-advisories/2026-018/)
+recommends considering isolation of internet-facing applications when a fix
+cannot be applied.
+
+### Publishing and removing the guards
+
+After merging, manually dispatch `build.yml` with `freescout_version=1.8.248`,
+`php_version=8.4`, the base digest above, and an empty `revision` to compute
+the next revision. The existing workflow tests the image before publishing
+to GHCR and Docker Hub. Branch pushes do not trigger builds, and the hourly
+watcher will not rebuild while the published and upstream base digests match.
+Deploy the resulting immutable revision and recreate affected containers;
+existing containers do not acquire these guards automatically.
+
+The hourly watcher will detect a new upstream base digest and trigger a
+rebuild. Before removing the guards, verify the built image's actual
+`php -r 'echo PHP_VERSION;'` output against official PHP advisories confirming
+fixes for **both** CVEs. A changed digest alone does not establish that PHP is
+fixed. Then remove `01-freescout-php-cve-guard.conf` and
+`zzz-freescout-php-security.ini` from `rootfs`, replace the multipart rejection
+tests with upload acceptance tests, and publish and deploy another revision.
+
 ## Environment variables
 
 ### Core

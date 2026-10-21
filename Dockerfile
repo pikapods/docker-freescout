@@ -172,7 +172,7 @@ RUN if [ "$WWW_DATA_UID" != "82" ] || [ "$WWW_DATA_GID" != "82" ]; then \
 
 VOLUME /data
 
-# Overlay our s6 bootstrap/scheduler services + nginx site config.
+# Overlay our s6 services, nginx site config, and temporary PHP security config.
 COPY rootfs/ /
 
 # - chown /etc/nginx to www-data: ServerSideUp's 10-init-webserver-config

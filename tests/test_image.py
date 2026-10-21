@@ -44,7 +44,10 @@ class TestImageMetadata:
         assert user in ("www-data", "82"), f"expected www-data/82, got {user!r}"
 
     def test_healthcheck_defined(self, inspect):
-        assert inspect["Config"].get("Healthcheck"), "no Healthcheck defined"
+        # Docker nests this under Config; Podman reports it at the top level.
+        assert inspect["Config"].get("Healthcheck") or inspect.get("Healthcheck"), (
+            "no Healthcheck defined"
+        )
 
     def test_exposes_8080(self, inspect):
         ports = inspect["Config"].get("ExposedPorts") or {}
@@ -70,6 +73,12 @@ class TestImageMetadata:
                  ' ini_get("opcache.validate_timestamps");')
         assert r.returncode == 0, r.stderr
         assert r.stdout == "101", f"enable/enable_cli/validate_timestamps = {r.stdout!r}"
+
+    def test_session_upload_progress_disabled(self):
+        r = _run("php", "-r", 'echo json_encode([extension_loaded("session"),'
+                 ' (bool) ini_get("session.upload_progress.enabled")]);')
+        assert r.returncode == 0, r.stderr
+        assert json.loads(r.stdout) == [True, False], r.stdout
 
 
 class TestImageFilesystem:

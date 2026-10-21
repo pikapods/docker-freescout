@@ -283,6 +283,95 @@ def test_login_responds_200(stack):
     assert 'type="password"' in body or "password" in body.lower()
 
 
+@pytest.fixture
+def php_security_probe(stack):
+    # Installed only in the disposable test container, never in the image.
+    name = f"__php_security_{secrets.token_hex(8)}"
+    probe = f"/var/www/html/public/{name}.php"
+    marker = f"/tmp/{name}.executed"
+    source = (
+        "<?php\n"
+        f"file_put_contents('{marker}', 'executed');\n"
+        "header('Content-Type: application/json');\n"
+        "echo json_encode([\n"
+        "  'sapi' => PHP_SAPI,\n"
+        "  'session_loaded' => extension_loaded('session'),\n"
+        "  'upload_progress_enabled' => (bool) ini_get('session.upload_progress.enabled'),\n"
+        "  'body' => file_get_contents('php://input'),\n"
+        "  'post' => $_POST,\n"
+        "]);\n"
+    )
+    encoded = base64.b64encode(source.encode()).decode()
+    r = _exec(stack["fs"], "php", "-r",
+              'exit(file_put_contents($argv[1], base64_decode($argv[2])) === false ? 1 : 0);',
+              probe, encoded)
+    try:
+        assert r.returncode == 0, f"could not write PHP probe: {r.stderr}"
+        yield {"path": f"/{name}.php", "marker": marker}
+    finally:
+        _exec(stack["fs"], "rm", "-f", probe, marker)
+
+
+@pytest.mark.parametrize("path", [None, "/login", "/index.php", "/healthcheck"])
+@pytest.mark.parametrize("method,content_type", [
+    ("POST", "multipart/form-data; boundary=freescout-test"),
+    ("POST", "MuLtIpArT/FoRm-DaTa; boundary=freescout-test"),
+    ("PUT", "multipart/form-data; boundary=freescout-test"),
+    ("PATCH", "multipart/mixed; boundary=freescout-test"),
+    ("GET", "multipart/form-data"),
+])
+def test_multipart_rejected_before_php(stack, php_security_probe, path, method, content_type):
+    path = php_security_probe["path"] if path is None else path
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{stack['port']}{path}",
+        data=b"--freescout-test\r\nContent-Disposition: form-data; name=\"test\"\r\n"
+             b"\r\nvalue\r\n--freescout-test--\r\n",
+        method=method,
+        headers={"Host": APP_HOST_HEADER, "Content-Type": content_type},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    with exc.value as response:
+        assert response.code == 403
+        assert response.read() == (
+            b"Multipart uploads are temporarily disabled pending a PHP security update."
+        )
+    r = _exec(stack["fs"], "test", "!", "-e", php_security_probe["marker"])
+    assert r.returncode == 0, "rejected request executed the PHP probe"
+
+
+@pytest.mark.parametrize("content_type,payload", [
+    ("application/x-www-form-urlencoded", b"test=value"),
+    ("application/json", b'{"test":"value"}'),
+])
+def test_non_multipart_reaches_php(stack, php_security_probe, content_type, payload):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{stack['port']}{php_security_probe['path']}",
+        data=payload,
+        headers={"Host": APP_HOST_HEADER, "Content-Type": content_type},
+    )
+    with urllib.request.urlopen(req, timeout=5) as response:
+        assert response.status == 200
+        result = json.load(response)
+    assert result["body"] == payload.decode()
+    if content_type == "application/x-www-form-urlencoded":
+        assert result["post"] == {"test": "value"}
+    assert _exec(stack["fs"], "test", "-f", php_security_probe["marker"]).returncode == 0
+
+
+def test_fpm_session_upload_progress_disabled(stack, php_security_probe):
+    with _http_get(f"http://127.0.0.1:{stack['port']}{php_security_probe['path']}") as response:
+        result = json.load(response)
+    assert result["sapi"] == "fpm-fcgi"
+    assert result["session_loaded"] is True
+    assert result["upload_progress_enabled"] is False
+
+
+def test_fpm_healthcheck_responds_200(stack):
+    with _http_get(f"http://127.0.0.1:{stack['port']}/healthcheck") as response:
+        assert response.status == 200
+
+
 @pytest.mark.parametrize("ext", ["log", "sql", "conf", "bak", "ini", "sh", "swp"])
 def test_attachment_url_reaches_laravel(stack, ext):
     # serversideup/php-nginx's server-opts.d/security.conf denies any URL
