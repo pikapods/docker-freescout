@@ -80,6 +80,11 @@ class TestImageMetadata:
         assert r.returncode == 0, r.stderr
         assert json.loads(r.stdout) == [True, False], r.stdout
 
+    def test_php_security_release(self, assert_patched_php):
+        r = _run("php", "-r", "echo PHP_VERSION;")
+        assert r.returncode == 0, r.stderr
+        assert_patched_php(r.stdout)
+
 
 class TestImageFilesystem:
     @pytest.mark.parametrize("link,target", [
